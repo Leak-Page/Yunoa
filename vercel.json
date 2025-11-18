@@ -1,0 +1,92 @@
+{
+  "functions": {
+    "api/**/*.js": {
+      "maxDuration": 30
+    }
+  },
+  "redirects": [
+    {
+      "source": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "yunoa-git-main-yunoas-projects.vercel.app"
+        }
+      ],
+      "destination": "https://www.yunoa.xyz",
+      "statusCode": 301
+    },
+    {
+      "source": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "yunoa-yunoas-projects.vercel.app"
+        }
+      ],
+      "destination": "https://www.yunoa.xyz",
+      "statusCode": 301
+    },
+    {
+      "source": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": ":preview.vercel.app"
+        }
+      ],
+      "destination": "https://www.yunoa.xyz",
+      "statusCode": 301
+    }
+  ],
+  "rewrites": [
+    {
+      "source": "/api/episodes",
+      "destination": "/api/episodes"
+    },
+    {
+      "source": "/api/videos/secure-stream/(.*)",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/videos/top-rated",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/videos/(.*)/subtitles",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/videos/(.*)/views",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/videos/(.*)",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/ratings/(.*)",
+      "destination": "/api/ratings"
+    },
+    {
+      "source": "/api/favorites/(.*)",
+      "destination": "/api/favorites"
+    },
+    {
+      "source": "/api/notifications/(.*)",
+      "destination": "/api/notifications"
+    },
+    {
+      "source": "/api/subtitles/(.*)",
+      "destination": "/api/videos"
+    },
+    {
+      "source": "/api/watch-history/(.*)",
+      "destination": "/api/history"
+    },
+    {
+      "source": "/((?!api).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
