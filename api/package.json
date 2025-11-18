@@ -1,0 +1,9 @@
+{
+  "type": "module",
+  "dependencies": {
+    "uuid": "^9.0.0",
+    "bcrypt": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.3"
+  }
+}
