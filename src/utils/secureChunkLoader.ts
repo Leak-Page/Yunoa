@@ -30,10 +30,11 @@ interface LoaderOptions {
 }
 
 export class SecureChunkLoader {
-  private chunkSize = 256 * 1024; // 256 KB par chunk (très petit pour validation fréquente)
+  private chunkSize = 512 * 1024; // 512 KB par chunk (cohérent avec le serveur)
   private currentToken: string;
   private fingerprint: string | null = null;
   private lastHash: string | null = null;
+  private sessionId: string | null = null;
   private chunks: BlobPart[] = [];
   private isAborted = false;
 
@@ -54,7 +55,21 @@ export class SecureChunkLoader {
 
     // Obtenir les métadonnées de la vidéo
     const metadata = await this.fetchMetadata();
+    
+    // Stocker le sessionId si disponible
+    if ((metadata as any).sessionId) {
+      this.sessionId = (metadata as any).sessionId;
+      console.log('[SecureChunkLoader] ✅ SessionId reçu:', this.sessionId.substring(0, 16) + '...');
+    }
+    
+    // Utiliser le token initial si fourni
+    if ((metadata as any).initialToken) {
+      this.currentToken = (metadata as any).initialToken;
+      console.log('[SecureChunkLoader] ✅ Token initial reçu');
+    }
+    
     const totalChunks = Math.ceil(metadata.size / this.chunkSize);
+    console.log(`[SecureChunkLoader] 📦 Chargement de ${totalChunks} chunks (${Math.round(metadata.size / 1024 / 1024)} MB)`);
     
     // Charger chaque chunk avec validation
     for (let i = 0; i < totalChunks; i++) {
@@ -62,25 +77,35 @@ export class SecureChunkLoader {
         throw new DOMException('Chargement annulé', 'AbortError');
       }
 
-      const chunk = await this.fetchChunk(i, totalChunks);
-      this.chunks.push(chunk.data);
-      
-      // Mettre à jour le token et le hash pour le prochain chunk
-      this.currentToken = chunk.nextToken;
-      this.lastHash = chunk.nextHash;
-
-      // Notifier la progression
-      if (this.options.onProgress) {
-        this.options.onProgress((i + 1) * this.chunkSize, metadata.size);
+      // Log de progression tous les 10 chunks ou pour les 5 premiers
+      if (i % 10 === 0 || i < 5) {
+        console.log(`[SecureChunkLoader] 📦 Chunk ${i + 1}/${totalChunks} (${Math.round((i / totalChunks) * 100)}%)`);
       }
 
-      if (this.options.onChunkValidated) {
-        this.options.onChunkValidated(i);
-      }
+      try {
+        const chunk = await this.fetchChunk(i, totalChunks);
+        this.chunks.push(chunk.data);
+        
+        // Mettre à jour le token et le hash pour le prochain chunk
+        this.currentToken = chunk.nextToken;
+        this.lastHash = chunk.nextHash;
 
-      // Vérifier l'expiration du token
-      if (Date.now() > chunk.expiresAt) {
-        throw new Error('Session expirée');
+        // Notifier la progression
+        if (this.options.onProgress) {
+          this.options.onProgress((i + 1) * this.chunkSize, metadata.size);
+        }
+
+        if (this.options.onChunkValidated) {
+          this.options.onChunkValidated(i);
+        }
+
+        // Vérifier l'expiration du token
+        if (Date.now() > chunk.expiresAt) {
+          throw new Error('Session expirée');
+        }
+      } catch (error) {
+        console.error(`[SecureChunkLoader] ❌ Erreur chunk ${i}:`, error);
+        throw error;
       }
     }
 
@@ -122,13 +147,23 @@ export class SecureChunkLoader {
    * Récupère un chunk avec validation
    */
   private async fetchChunk(index: number, totalChunks: number): Promise<ChunkResponse> {
-    const request: ChunkRequest = {
+    const request: any = {
       videoId: this.options.videoId,
       chunkIndex: index,
       timestamp: Date.now(),
       fingerprint: this.fingerprint!,
-      previousHash: this.lastHash || undefined
+      encrypted: false // Mode non-chiffré pour SecureChunkLoader
     };
+
+    // Inclure le sessionId si disponible
+    if (this.sessionId) {
+      request.sessionId = this.sessionId;
+    }
+
+    // Ne pas envoyer previousHash pour le premier chunk
+    if (index > 0 && this.lastHash) {
+      request.previousHash = this.lastHash;
+    }
 
     const response = await fetch(`/api/videos/secure-stream/chunk`, {
       method: 'POST',

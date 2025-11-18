@@ -28,7 +28,6 @@ import { supabase } from "@/integrations/supabase/client"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { EncryptedMSELoader } from "@/utils/encryptedMSELoader"
 import { VideoSecurityManager } from "@/utils/videoSecurity"
 
 // Custom Slider Component avec corrections d'alignement
@@ -246,11 +245,9 @@ const VideoPlayerComponent = () => {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [buffered, setBuffered] = useState(0)
   const [isBuffering, setIsBuffering] = useState(false)
-  const mseLoaderRef = useRef<EncryptedMSELoader | null>(null)
   const secManagerRef = useRef<VideoSecurityManager | null>(null)
   useEffect(() => {
     return () => {
-      mseLoaderRef.current?.cleanup();
       secManagerRef.current?.cleanup?.();
     };
   }, []);
@@ -595,10 +592,10 @@ const VideoPlayerComponent = () => {
       videoElement.removeAttribute("src")
       videoElement.load()
 
-      // Nettoyer l'ancien loader MSE
-      if (mseLoaderRef.current) {
-        mseLoaderRef.current.cleanup()
-        mseLoaderRef.current = null
+      // Nettoyer l'ancien loader si nécessaire
+      if (secManagerRef.current) {
+        secManagerRef.current.cleanup();
+        secManagerRef.current = null;
       }
 
       // Add comprehensive error handling
@@ -658,60 +655,45 @@ const VideoPlayerComponent = () => {
         }
       }
 
-      // Charger avec MSE chiffré
+      // Charger la vidéo de manière sécurisée avec micro-chunks
+      console.log('[VideoPlayer] 🎬 Démarrage du chargement sécurisé pour videoId:', videoId);
+      
+      if (!secManagerRef.current) {
+        secManagerRef.current = new VideoSecurityManager();
+      }
+
       try {
-        console.log('[VideoPlayer] 🎬 Démarrage du chargement MSE pour videoId:', videoId);
-        setIsBuffering(true)
+        setIsBuffering(true);
         
-        mseLoaderRef.current = new EncryptedMSELoader({
+        // Charger la vidéo via le système sécurisé
+        const blobUrl = await secManagerRef.current.loadSecureVideo({
+          videoUrl,
           videoId,
           sessionToken: token,
-          videoElement,
-          onProgress: (loaded, total) => {
-            const progress = (loaded / total) * 100
-            setBuffered(progress)
+          onProgress: (progress) => {
+            setBuffered(progress);
             console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progress)}%`);
-          },
-          onError: (error) => {
-            console.error('[VideoPlayer] ❌ Erreur MSE:', error)
-            setError(error.message)
-            setIsBuffering(false)
           }
-        })
+        });
 
-        videoElement.addEventListener("error", handleVideoError, { once: true })
-        videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true })
-        videoElement.addEventListener("canplay", handleCanPlay, { once: true })
+        // Configurer les event listeners avant de définir la source
+        videoElement.addEventListener("error", handleVideoError, { once: true });
+        videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true });
+        videoElement.addEventListener("canplay", handleCanPlay, { once: true });
 
-        console.log('[VideoPlayer] 🚀 Initialisation du MSE loader...');
-        await mseLoaderRef.current.initialize()
-
-        console.log('[VideoPlayer] ✅ MSE loader initialisé avec succès');
-        setIsBuffering(false)
+        // Définir la source vidéo
+        videoElement.src = blobUrl;
+        
+        // Charger la vidéo
+        await videoElement.load();
+        
+        console.log('[VideoPlayer] ✅ Vidéo chargée avec succès');
+        setIsBuffering(false);
+        
       } catch (error) {
-        console.error('[VideoPlayer] ❌ Erreur initialisation MSE:', error)
-        // Fallback sécurisé sans MSE (micro-chunks -> Blob URL)
-        try {
-          console.log('[VideoPlayer] ⚠️ Bascule en mode sécurisé non-MSE (blob)');
-          if (!secManagerRef.current) {
-            secManagerRef.current = new VideoSecurityManager();
-          }
-          const blobUrl = await secManagerRef.current.loadSecureVideo({
-            videoUrl,
-            videoId,
-            sessionToken: token,
-            onProgress: (p) => setBuffered(p)
-          });
-          videoElement.src = blobUrl;
-          await videoElement.play();
-          setIsPlaying(true);
-          setError(null);
-        } catch (fallbackErr) {
-          console.error('[VideoPlayer] ❌ Fallback non-MSE échoué:', fallbackErr);
-          setError('Impossible de charger la vidéo');
-        } finally {
-          setIsBuffering(false)
-        }
+        console.error('[VideoPlayer] ❌ Erreur chargement vidéo:', error);
+        setError(error instanceof Error ? error.message : 'Impossible de charger la vidéo');
+        setIsBuffering(false);
       }
     } catch (error) {
       console.error("Error in loadVideoSource:", error)
