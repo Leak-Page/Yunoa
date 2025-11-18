@@ -29,6 +29,7 @@ export class EncryptedMSELoader {
   private currentToken: string;
   private fingerprint: string | null = null;
   private lastHash: string | null = null;
+  private sessionId: string | null = null;
   private isAborted = false;
   private encryptionKey: CryptoKey | null = null;
   private chunkQueue: ArrayBuffer[] = [];
@@ -61,6 +62,12 @@ export class EncryptedMSELoader {
         totalChunks: metadata.totalChunks, 
         size: Math.round(metadata.size / 1024 / 1024) + ' MB' 
       });
+
+      // Stocker le sessionId pour identifier la session
+      if ((metadata as any).sessionId) {
+        this.sessionId = (metadata as any).sessionId;
+        console.log('[MSE] ✅ SessionId reçu:', this.sessionId.substring(0, 16) + '...');
+      }
 
       // Utiliser le token éphémère initial renvoyé par le serveur pour le premier chunk
       if ((metadata as any).initialToken) {
@@ -179,6 +186,7 @@ export class EncryptedMSELoader {
     totalChunks: number; 
     encryptionSeed: string;
     initialToken?: string;
+    sessionId?: string;
   }> {
     const response = await fetch(`/api/videos/secure-stream/metadata`, {
       method: 'POST',
@@ -358,6 +366,11 @@ export class EncryptedMSELoader {
       fingerprint: this.fingerprint!,
       encrypted: true
     };
+
+    // Inclure le sessionId si disponible pour identifier la session correcte
+    if (this.sessionId) {
+      requestBody.sessionId = this.sessionId;
+    }
 
     // Ne pas envoyer previousHash pour le premier chunk
     if (index > 0 && this.lastHash) {

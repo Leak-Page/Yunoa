@@ -290,7 +290,7 @@ export default async (req, res) => {
         return res.status(401).json({ error: 'Token manquant' });
       }
 
-      const { videoId, chunkIndex, timestamp, fingerprint, previousHash, encrypted } = req.body;
+      const { videoId, chunkIndex, timestamp, fingerprint, previousHash, encrypted, sessionId } = req.body;
       const totalChunks = parseInt(req.headers['x-total-chunks'] || '0');
 
       if (videoId === undefined || chunkIndex === undefined || !fingerprint) {
@@ -310,13 +310,48 @@ export default async (req, res) => {
 
       // Trouver la session
       let session = null;
-      for (const [sid, sess] of secureStreams.entries()) {
-        if (sess.userId === decoded.userId && 
-            sess.videoId === videoId && 
-            sess.fingerprint === fingerprint) {
-          session = sess;
-          break;
+      
+      // Si sessionId est fourni, l'utiliser directement
+      if (sessionId) {
+        session = secureStreams.get(sessionId);
+        if (session && (session.userId !== decoded.userId || 
+                        session.videoId !== videoId || 
+                        session.fingerprint !== fingerprint)) {
+          // SessionId fourni mais ne correspond pas aux critères
+          session = null;
         }
+      }
+      
+      // Sinon, chercher par userId/videoId/fingerprint
+      // Si plusieurs sessions existent, prendre celle avec chunksDelivered === chunkIndex
+      // Sinon, prendre la plus récente avec chunksDelivered === 0 (pour le chunk 0)
+      if (!session) {
+        let exactMatch = null; // Session avec chunksDelivered === chunkIndex
+        let unusedSession = null; // Session avec chunksDelivered === 0 (pour le chunk 0)
+        let latestTime = 0;
+        
+        for (const [sid, sess] of secureStreams.entries()) {
+          if (sess.userId === decoded.userId && 
+              sess.videoId === videoId && 
+              sess.fingerprint === fingerprint) {
+            // Session exacte (chunksDelivered === chunkIndex)
+            if (sess.chunksDelivered === chunkIndex) {
+              if (!exactMatch || sess.createdAt > (exactMatch.createdAt || 0)) {
+                exactMatch = sess;
+              }
+            }
+            // Session non utilisée (pour le chunk 0)
+            if (chunkIndex === 0 && sess.chunksDelivered === 0) {
+              if (!unusedSession || sess.createdAt > latestTime) {
+                unusedSession = sess;
+                latestTime = sess.createdAt;
+              }
+            }
+          }
+        }
+        
+        // Utiliser la session exacte si disponible, sinon la session non utilisée
+        session = exactMatch || unusedSession;
       }
 
       if (!session) {
