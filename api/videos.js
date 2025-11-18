@@ -376,7 +376,10 @@ export default async (req, res) => {
       const chunkHash = generateHash(Buffer.from(chunkData).toString('base64'));
 
       // Générer le prochain token et hash
-      const nextToken = generateTimedToken(decoded.userId, videoId, chunkIndex + 1, fingerprint);
+      // Le token doit contenir le chunkIndex du chunk actuel (pas +1) car la validation
+      // vérifie que decoded.chunkIndex === expectedChunkIndex - 1
+      // Donc pour valider le chunk 1, le token doit avoir chunkIndex = 0
+      const nextToken = generateTimedToken(decoded.userId, videoId, chunkIndex, fingerprint);
       const nextHash = generateHash(`${chunkIndex + 1}:${videoId}:${fingerprint}:${now}`);
 
       // Si chiffrement demandé (mode MSE)
