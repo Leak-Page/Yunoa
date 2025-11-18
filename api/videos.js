@@ -318,7 +318,10 @@ export default async (req, res) => {
                         session.videoId !== videoId || 
                         session.fingerprint !== fingerprint)) {
           // SessionId fourni mais ne correspond pas aux critères
+          console.log(`⚠️ SessionId fourni (${sessionId.substring(0, 16)}...) mais ne correspond pas aux critères`);
           session = null;
+        } else if (session) {
+          console.log(`✅ Session trouvée via sessionId: ${sessionId.substring(0, 16)}..., chunksDelivered: ${session.chunksDelivered}`);
         }
       }
       
@@ -360,6 +363,24 @@ export default async (req, res) => {
 
       // Vérifier la cohérence temporelle (pas de sauts dans le temps)
       const now = Date.now();
+      
+      // Si c'est le chunk 0 et que la session n'a pas encore été utilisée, réinitialiser lastChunkTime
+      // Cela permet d'éviter les timeouts si la session a été créée il y a longtemps
+      // Si le sessionId correspond, c'est une nouvelle utilisation de la session
+      if (chunkIndex === 0 && session.chunksDelivered === 0) {
+        if (sessionId) {
+          // Si le sessionId est fourni et correspond, réinitialiser le temps
+          console.log(`🔄 Réinitialisation du lastChunkTime pour session ${sessionId.substring(0, 16)}... (créée il y a ${Math.round((now - session.createdAt) / 1000)}s)`);
+          session.lastChunkTime = now;
+        } else {
+          // Si pas de sessionId, vérifier si la session est récente (moins de 5 min)
+          const timeSinceCreation = now - session.createdAt;
+          if (timeSinceCreation > 5 * 60 * 1000) {
+            console.log(`⚠️ Session créée il y a ${Math.round(timeSinceCreation / 1000)}s, risque de timeout`);
+          }
+        }
+      }
+      
       // Timeout plus long pour le premier chunk (5 min), ensuite 90 secondes entre chunks
       const timeoutLimit = chunkIndex === 0 ? 5 * 60 * 1000 : 90 * 1000;
       if (now - session.lastChunkTime > timeoutLimit) {

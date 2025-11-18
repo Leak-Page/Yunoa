@@ -380,6 +380,8 @@ export class EncryptedMSELoader {
     console.log(`[MSE] 📡 Requête chunk ${index}/${totalChunks}`, {
       hasToken: !!this.currentToken,
       hasPreviousHash: index > 0 && !!this.lastHash,
+      hasSessionId: !!this.sessionId,
+      sessionIdPreview: this.sessionId?.substring(0, 16) + '...',
       tokenPreview: this.currentToken?.substring(0, 20) + '...'
     });
 
