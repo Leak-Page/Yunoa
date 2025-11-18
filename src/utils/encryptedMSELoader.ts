@@ -65,7 +65,9 @@ export class EncryptedMSELoader {
       // Utiliser le token éphémère initial renvoyé par le serveur pour le premier chunk
       if ((metadata as any).initialToken) {
         this.currentToken = (metadata as any).initialToken;
-        console.log('[MSE] ✅ Token initial reçu');
+        console.log('[MSE] ✅ Token initial reçu et stocké');
+      } else {
+        throw new Error('Token initial manquant dans les métadonnées');
       }
       
       // Dériver la clé de déchiffrement
@@ -151,7 +153,14 @@ export class EncryptedMSELoader {
       });
 
       console.log('[MSE] 🎬 Démarrage du streaming des chunks...');
-      // Commencer le streaming
+      console.log('[MSE] 📋 Informations de session:', {
+        videoId: this.options.videoId,
+        fingerprint: this.fingerprint?.substring(0, 16) + '...',
+        hasToken: !!this.currentToken,
+        tokenLength: this.currentToken?.length
+      });
+      
+      // Commencer le streaming immédiatement pour éviter l'expiration du token
       await this.streamChunks(metadata.totalChunks);
 
     } catch (error) {
@@ -341,6 +350,26 @@ export class EncryptedMSELoader {
     index: number, 
     totalChunks: number
   ): Promise<EncryptedChunkResponse> {
+    // Pour le chunk 0, ne pas envoyer previousHash
+    const requestBody: any = {
+      videoId: this.options.videoId,
+      chunkIndex: index,
+      timestamp: Date.now(),
+      fingerprint: this.fingerprint!,
+      encrypted: true
+    };
+
+    // Ne pas envoyer previousHash pour le premier chunk
+    if (index > 0 && this.lastHash) {
+      requestBody.previousHash = this.lastHash;
+    }
+
+    console.log(`[MSE] 📡 Requête chunk ${index}/${totalChunks}`, {
+      hasToken: !!this.currentToken,
+      hasPreviousHash: index > 0 && !!this.lastHash,
+      tokenPreview: this.currentToken?.substring(0, 20) + '...'
+    });
+
     const response = await fetch(`/api/videos/secure-stream/chunk`, {
       method: 'POST',
       headers: {
@@ -349,24 +378,33 @@ export class EncryptedMSELoader {
         'X-Chunk-Index': index.toString(),
         'X-Total-Chunks': totalChunks.toString()
       },
-      body: JSON.stringify({
-        videoId: this.options.videoId,
-        chunkIndex: index,
-        timestamp: Date.now(),
-        fingerprint: this.fingerprint!,
-        previousHash: this.lastHash || undefined,
-        encrypted: true
-      }),
+      body: JSON.stringify(requestBody),
       signal: this.options.signal
     });
 
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`[MSE] ❌ Erreur chunk ${index}:`, response.status, errorText);
-      throw new Error(`Erreur chunk ${index}: ${response.status} - ${errorText}`);
+      
+      // Essayer de parser l'erreur pour plus de détails
+      try {
+        const errorData = JSON.parse(errorText);
+        if (errorData.code === 'INVALID_SEQUENCE') {
+          throw new Error(`Séquence invalide: le serveur attend le chunk ${index} mais la session n'est pas synchronisée. Veuillez recharger la page.`);
+        }
+        throw new Error(`Erreur chunk ${index}: ${response.status} - ${errorData.error || errorText}`);
+      } catch (parseError) {
+        throw new Error(`Erreur chunk ${index}: ${response.status} - ${errorText}`);
+      }
     }
 
-    return response.json();
+    const result = await response.json();
+    console.log(`[MSE] ✅ Chunk ${index} reçu`, {
+      hasNextToken: !!result.nextToken,
+      hasNextHash: !!result.nextHash
+    });
+
+    return result;
   }
 
   /**
