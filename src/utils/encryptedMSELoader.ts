@@ -33,6 +33,8 @@ export class EncryptedMSELoader {
   private encryptionKey: CryptoKey | null = null;
   private chunkQueue: ArrayBuffer[] = [];
   private isAppending = false;
+  private updateEndPromise: Promise<void> | null = null;
+  private updateEndResolve: (() => void) | null = null;
 
   constructor(private options: MSELoaderOptions) {
     this.currentToken = options.sessionToken;
@@ -106,14 +108,31 @@ export class EncryptedMSELoader {
             this.sourceBuffer = this.mediaSource.addSourceBuffer(codec);
             console.log('[MSE] ✅ SourceBuffer créé avec codec:', codec);
             
+            // Créer une promesse pour attendre la fin de l'update
+            this.updateEndPromise = new Promise<void>((resolve) => {
+              this.updateEndResolve = resolve;
+            });
+            
             this.sourceBuffer.addEventListener('updateend', () => {
               // Libérer le verrou d'append une fois l'opération terminée
               this.isAppending = false;
+              if (this.updateEndResolve) {
+                this.updateEndResolve();
+                this.updateEndResolve = null;
+                this.updateEndPromise = null;
+              }
+              // Traiter la queue après chaque append
               this.processQueue();
             });
 
             this.sourceBuffer.addEventListener('error', (e) => {
               console.error('[MSE] ❌ Erreur SourceBuffer:', e);
+              this.isAppending = false;
+              if (this.updateEndResolve) {
+                this.updateEndResolve();
+                this.updateEndResolve = null;
+                this.updateEndPromise = null;
+              }
             });
 
             resolve();
@@ -207,6 +226,15 @@ export class EncryptedMSELoader {
         console.log(`[MSE] 📦 Chunk ${i + 1}/${totalChunks} (${Math.round((i / totalChunks) * 100)}%)`);
       }
 
+      // Attendre que le buffer ait de l'espace avant de télécharger le prochain chunk
+      // Limiter la queue à 5 chunks pour éviter de surcharger la mémoire
+      while (this.chunkQueue.length >= 5) {
+        await this.waitForBufferSpace();
+        if (this.isAborted) {
+          throw new DOMException('Streaming annulé', 'AbortError');
+        }
+      }
+
       const encryptedChunk = await this.fetchEncryptedChunk(i, totalChunks);
       const decryptedChunk = await this.decryptChunk(encryptedChunk);
 
@@ -229,12 +257,80 @@ export class EncryptedMSELoader {
       }
     }
 
+    // Attendre que tous les chunks soient ajoutés au buffer
+    console.log('[MSE] ⏳ Attente de la fin du traitement de la queue...');
+    while (this.chunkQueue.length > 0 || this.isAppending) {
+      await this.waitForBufferSpace();
+      if (this.isAborted) {
+        throw new DOMException('Streaming annulé', 'AbortError');
+      }
+    }
+
     console.log('[MSE] ✅ Tous les chunks streamés, finalisation...');
     
     // Finaliser le stream
     if (this.mediaSource && this.mediaSource.readyState === 'open') {
+      await new Promise<void>((resolve) => {
+        if (!this.sourceBuffer || this.sourceBuffer.updating) {
+          // Attendre que le buffer soit prêt
+          const checkReady = () => {
+            if (!this.sourceBuffer || !this.sourceBuffer.updating) {
+              resolve();
+            } else {
+              setTimeout(checkReady, 50);
+            }
+          };
+          checkReady();
+        } else {
+          resolve();
+        }
+      });
+      
       this.mediaSource.endOfStream();
       console.log('[MSE] ✅ Stream finalisé');
+    }
+  }
+
+  /**
+   * Attendre que le buffer ait de l'espace
+   */
+  private async waitForBufferSpace(): Promise<void> {
+    if (!this.sourceBuffer) {
+      return;
+    }
+
+    // Si le buffer est en train d'être mis à jour, attendre
+    if (this.sourceBuffer.updating || this.isAppending) {
+      if (this.updateEndPromise) {
+        await this.updateEndPromise;
+      } else {
+        // Si aucune promesse n'existe mais que le buffer est en train d'être mis à jour,
+        // attendre que l'opération se termine
+        await new Promise<void>((resolve) => {
+          const checkReady = () => {
+            if (!this.sourceBuffer || (!this.sourceBuffer.updating && !this.isAppending)) {
+              resolve();
+            } else {
+              setTimeout(checkReady, 50);
+            }
+          };
+          checkReady();
+        });
+      }
+    }
+
+    // Vérifier si le buffer est plein (QuotaExceededError)
+    // Si c'est le cas, attendre un peu et réessayer
+    if (this.sourceBuffer.buffered.length > 0) {
+      const bufferedEnd = this.sourceBuffer.buffered.end(this.sourceBuffer.buffered.length - 1);
+      const videoElement = this.options.videoElement;
+      if (videoElement && videoElement.currentTime > 0) {
+        // Si le buffer est trop en avance, attendre un peu
+        const bufferAhead = bufferedEnd - videoElement.currentTime;
+        if (bufferAhead > 30) { // Plus de 30 secondes d'avance
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
     }
   }
 
@@ -310,21 +406,53 @@ export class EncryptedMSELoader {
       return;
     }
 
+    // Vérifier si le MediaSource est toujours ouvert
+    if (!this.mediaSource || this.mediaSource.readyState !== 'open') {
+      console.warn('[MSE] ⚠️ MediaSource n\'est plus ouvert');
+      return;
+    }
+
     this.isAppending = true;
     const chunk = this.chunkQueue.shift();
     
     if (chunk) {
       try {
+        // Créer une nouvelle promesse pour attendre la fin de cet append
+        this.updateEndPromise = new Promise<void>((resolve) => {
+          this.updateEndResolve = resolve;
+        });
+        
         this.sourceBuffer.appendBuffer(chunk);
-      } catch (error) {
-        console.error('Erreur appendBuffer:', error);
-        if (this.options.onError) {
-          this.options.onError(error as Error);
+      } catch (error: any) {
+        this.isAppending = false;
+        console.error('[MSE] ❌ Erreur appendBuffer:', error);
+        
+        // Gérer le cas où le buffer est plein
+        if (error.name === 'QuotaExceededError') {
+          console.warn('[MSE] ⚠️ Buffer plein, remise du chunk dans la queue');
+          // Remettre le chunk dans la queue
+          if (chunk) {
+            this.chunkQueue.unshift(chunk);
+          }
+          // Attendre un peu avant de réessayer
+          setTimeout(() => {
+            this.processQueue();
+          }, 100);
+        } else {
+          if (this.options.onError) {
+            this.options.onError(error as Error);
+          }
+        }
+        
+        if (this.updateEndResolve) {
+          this.updateEndResolve();
+          this.updateEndResolve = null;
+          this.updateEndPromise = null;
         }
       }
+    } else {
+      this.isAppending = false;
     }
-    
-    this.isAppending = false;
   }
 
   /**
@@ -333,6 +461,13 @@ export class EncryptedMSELoader {
   abort(): void {
     this.isAborted = true;
     this.chunkQueue = [];
+    this.isAppending = false;
+    
+    if (this.updateEndResolve) {
+      this.updateEndResolve();
+      this.updateEndResolve = null;
+      this.updateEndPromise = null;
+    }
     
     if (this.mediaSource && this.mediaSource.readyState === 'open') {
       try {
