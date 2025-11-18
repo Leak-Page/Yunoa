@@ -62,6 +62,7 @@ export class VideoSecurityManager {
         }
 
         // Utiliser le système de micro-chunks avec validation continue
+        // Note: videoElement sera passé depuis VideoPlayerComponent si disponible
         const loader = new SecureChunkLoader({
           videoUrl,
           videoId,

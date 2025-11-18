@@ -655,8 +655,8 @@ const VideoPlayerComponent = () => {
         }
       }
 
-      // Charger la vidéo de manière sécurisée avec micro-chunks
-      console.log('[VideoPlayer] 🎬 Démarrage du chargement sécurisé pour videoId:', videoId);
+      // Charger la vidéo de manière sécurisée avec streaming progressif
+      console.log('[VideoPlayer] 🎬 Démarrage du streaming sécurisé pour videoId:', videoId);
       
       if (!secManagerRef.current) {
         secManagerRef.current = new VideoSecurityManager();
@@ -665,33 +665,38 @@ const VideoPlayerComponent = () => {
       try {
         setIsBuffering(true);
         
-        // Charger la vidéo via le système sécurisé
-        const blobUrl = await secManagerRef.current.loadSecureVideo({
+        // Configurer les event listeners avant de définir la source
+        videoElement.addEventListener("error", handleVideoError, { once: true });
+        videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true });
+        videoElement.addEventListener("canplay", handleCanPlay, { once: true });
+
+        // Charger la vidéo via le système sécurisé avec streaming MSE
+        // On passe directement le loader avec l'élément vidéo pour le streaming progressif
+        const { SecureChunkLoader } = await import('@/utils/secureChunkLoader');
+        const loader = new SecureChunkLoader({
           videoUrl,
           videoId,
           sessionToken: token,
+          videoElement, // Passer l'élément vidéo pour activer le streaming MSE
           onProgress: (progress) => {
             setBuffered(progress);
             console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progress)}%`);
           }
         });
 
-        // Configurer les event listeners avant de définir la source
-        videoElement.addEventListener("error", handleVideoError, { once: true });
-        videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true });
-        videoElement.addEventListener("canplay", handleCanPlay, { once: true });
-
-        // Définir la source vidéo
-        videoElement.src = blobUrl;
+        const blobUrl = await loader.load();
         
-        // Charger la vidéo
-        await videoElement.load();
+        // Si ce n'est pas déjà fait par MSE, définir la source
+        if (!videoElement.src || !videoElement.src.startsWith('blob:')) {
+          videoElement.src = blobUrl;
+          await videoElement.load();
+        }
         
-        console.log('[VideoPlayer] ✅ Vidéo chargée avec succès');
+        console.log('[VideoPlayer] ✅ Streaming démarré avec succès');
         setIsBuffering(false);
         
       } catch (error) {
-        console.error('[VideoPlayer] ❌ Erreur chargement vidéo:', error);
+        console.error('[VideoPlayer] ❌ Erreur streaming vidéo:', error);
         setError(error instanceof Error ? error.message : 'Impossible de charger la vidéo');
         setIsBuffering(false);
       }
