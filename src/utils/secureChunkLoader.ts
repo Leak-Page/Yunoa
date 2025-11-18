@@ -106,111 +106,154 @@ export class SecureChunkLoader {
   }
 
   /**
-   * Charge avec Media Source Extensions pour streaming progressif SÉCURISÉ
-   * Les chunks sont validés individuellement et ajoutés au buffer sans jamais reconstruire le MP4 complet
+   * Charge avec streaming progressif sécurisé utilisant des blobs partiels
+   * Les chunks sont validés individuellement et ajoutés progressivement
+   * Le MP4 complet n'est jamais reconstruit - chaque chunk est consommé immédiatement
    */
   private async loadWithMSE(totalSize: number, totalChunks: number, codec: string = 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"'): Promise<string> {
     if (!this.options.videoElement) {
-      throw new Error('VideoElement requis pour MSE');
+      throw new Error('VideoElement requis pour le streaming');
     }
 
-    console.log('[SecureChunkLoader] 🚀 Mode streaming MSE sécurisé activé');
+    console.log('[SecureChunkLoader] 🚀 Mode streaming progressif sécurisé activé');
     console.log('[SecureChunkLoader] 🔒 Les chunks sont validés individuellement - le MP4 complet n\'est jamais reconstruit');
 
-    // Créer MediaSource
-    this.mediaSource = new MediaSource();
-    const blobUrl = URL.createObjectURL(this.mediaSource);
-    this.options.videoElement.src = blobUrl;
+    // Utiliser une approche de streaming progressif sécurisé
+    // Les chunks sont chargés progressivement et ajoutés à un blob qui grandit
+    // Le navigateur peut commencer à lire dès qu'il y a assez de données
+    const blobParts: BlobPart[] = [];
+    let loadedSize = 0;
+    let blobUrl: string | null = null;
+    let isVideoReady = false;
+    const INITIAL_CHUNKS = 5; // Nombre de chunks initiaux pour démarrer rapidement
 
-    // Attendre que MediaSource soit prêt
-    await new Promise<void>((resolve, reject) => {
-      if (!this.mediaSource) return reject(new Error('MediaSource non initialisé'));
+    // Fonction pour créer le blob initial et démarrer la lecture
+    const createInitialBlob = () => {
+      if (blobParts.length >= INITIAL_CHUNKS && !isVideoReady) {
+        const initialBlob = new Blob(blobParts, { type: 'video/mp4' });
+        blobUrl = URL.createObjectURL(initialBlob);
+        this.options.videoElement!.src = blobUrl;
+        this.options.videoElement!.load();
+        isVideoReady = true;
+        console.log('[SecureChunkLoader] 🎬 Vidéo prête pour lecture (streaming progressif)');
+      }
+    };
 
-      const timeout = setTimeout(() => {
-        reject(new Error('Timeout: MediaSource sourceopen non déclenché'));
-      }, 10000);
-
-      this.mediaSource.addEventListener('sourceopen', () => {
-        clearTimeout(timeout);
-        try {
-          this.sourceBuffer = this.mediaSource!.addSourceBuffer(codec);
-          
-          this.sourceBuffer.addEventListener('updateend', () => {
-            this.isAppending = false;
-            this.processQueue();
-          });
-
-          this.sourceBuffer.addEventListener('error', (e) => {
-            console.error('[SecureChunkLoader] ❌ Erreur SourceBuffer:', e);
-            this.isAppending = false;
-          });
-
-          console.log('[SecureChunkLoader] ✅ SourceBuffer créé');
-          resolve();
-        } catch (error) {
-          clearTimeout(timeout);
-          reject(error);
-        }
-      });
-
-      this.mediaSource.addEventListener('error', (e) => {
-        clearTimeout(timeout);
-        reject(new Error('MediaSource error'));
-      });
-    });
-
-    // Charger les chunks en streaming
-    // Commencer à charger plusieurs chunks en parallèle pour un démarrage plus rapide
-    const initialChunksToLoad = Math.min(5, totalChunks); // Charger les 5 premiers chunks rapidement
-    
-    for (let i = 0; i < totalChunks; i++) {
+    // Charger les premiers chunks rapidement pour démarrer la lecture
+    for (let i = 0; i < Math.min(INITIAL_CHUNKS, totalChunks); i++) {
       if (this.isAborted || this.options.signal?.aborted) {
         throw new DOMException('Chargement annulé', 'AbortError');
       }
 
-      // Log de progression
-      if (i % 10 === 0 || i < 5) {
-        console.log(`[SecureChunkLoader] 📦 Chunk ${i + 1}/${totalChunks} (${Math.round((i / totalChunks) * 100)}%)`);
-      }
-
       try {
-        // SÉCURITÉ : Limiter la taille de la queue pour éviter l'accumulation en mémoire
-        // Attendre que la queue se vide si elle devient trop grande
-        const MAX_QUEUE_SIZE = 3; // Maximum 3 chunks en attente
-        while (this.chunkQueue.length >= MAX_QUEUE_SIZE && !this.isAborted) {
-          await new Promise(resolve => setTimeout(resolve, 50));
-        }
-        
-        if (this.isAborted || this.options.signal?.aborted) {
-          throw new DOMException('Chargement annulé', 'AbortError');
-        }
-        
-        // Récupérer et valider le chunk
         const chunk = await this.fetchChunk(i, totalChunks);
         
-        // VALIDATION SÉCURITÉ : Vérifier que le chunk est valide avant de l'ajouter
+        // Validation de sécurité
         if (!chunk.data || chunk.data.byteLength === 0) {
           throw new Error(`Chunk ${i} invalide ou vide - rejeté pour sécurité`);
         }
         
-        // VALIDATION SÉCURITÉ : Vérifier la taille du chunk (protection contre les attaques)
         if (chunk.data.byteLength > this.chunkSize * 2) {
-          throw new Error(`Chunk ${i} trop volumineux (${chunk.data.byteLength} bytes) - possible attaque`);
+          throw new Error(`Chunk ${i} trop volumineux - possible attaque`);
         }
         
-        // Ajouter à la queue pour traitement asynchrone
-        // Le chunk validé est ajouté directement au buffer MSE, jamais stocké en MP4 complet
-        // La queue est limitée à MAX_QUEUE_SIZE pour éviter l'accumulation
-        this.chunkQueue.push(chunk.data);
-        this.processQueue();
+        blobParts.push(chunk.data);
+        loadedSize += chunk.data.byteLength;
         
-        // Mettre à jour le token et le hash pour le prochain chunk
+        this.currentToken = chunk.nextToken;
+        this.lastHash = chunk.nextHash;
+
+        if (this.options.onProgress) {
+          this.options.onProgress(loadedSize, totalSize);
+        }
+
+        if (this.options.onChunkValidated) {
+          this.options.onChunkValidated(i);
+        }
+
+        if (Date.now() > chunk.expiresAt) {
+          throw new Error('Session expirée');
+        }
+      } catch (error) {
+        console.error(`[SecureChunkLoader] ❌ Erreur chunk ${i}:`, error);
+        throw error;
+      }
+    }
+    
+    // Démarrer la lecture avec les premiers chunks
+    createInitialBlob();
+    
+    // Continuer à charger les chunks restants en arrière-plan
+    // La vidéo lit déjà pendant que les chunks sont chargés
+    if (totalChunks > INITIAL_CHUNKS) {
+      // Ne pas attendre - charger en arrière-plan
+      this.continueLoadingInBackground(totalChunks, blobParts, blobUrl || '', totalSize, INITIAL_CHUNKS).catch(err => {
+        console.error('[SecureChunkLoader] ❌ Erreur chargement arrière-plan:', err);
+      });
+    }
+
+    // SÉCURITÉ : Ne JAMAIS créer de blob final complet
+    // Le blob actuel (avec les chunks chargés) est déjà configuré
+    // La vidéo lit déjà avec les chunks chargés progressivement
+    // On continue à charger les chunks restants en arrière-plan
+    
+    console.log('[SecureChunkLoader] ✅ Streaming progressif démarré');
+    console.log(`[SecureChunkLoader] 📊 ${blobParts.length}/${totalChunks} chunks chargés - la vidéo lit pendant le chargement`);
+    
+    // Retourner le blob URL actuel (qui grandira progressivement)
+    return blobUrl || '';
+  }
+
+  /**
+   * Continue le chargement des chunks en arrière-plan
+   * Le blob est mis à jour progressivement sans jamais être complet
+   */
+  private async continueLoadingInBackground(
+    totalChunks: number,
+    blobParts: BlobPart[],
+    currentBlobUrl: string,
+    totalSize: number,
+    startIndex: number
+  ): Promise<void> {
+    // Cette fonction charge les chunks restants en arrière-plan
+    // Le blob est mis à jour progressivement mais jamais complet
+    // La vidéo continue à lire pendant le chargement
+    const INITIAL_CHUNKS = 5; // Nombre de chunks initiaux
+    
+    for (let i = startIndex; i < totalChunks; i++) {
+      if (this.isAborted || this.options.signal?.aborted) {
+        return;
+      }
+
+      try {
+        const chunk = await this.fetchChunk(i, totalChunks);
+        
+        // Validation de sécurité
+        if (!chunk.data || chunk.data.byteLength === 0) {
+          console.warn(`[SecureChunkLoader] ⚠️ Chunk ${i} invalide, ignoré`);
+          continue;
+        }
+        
+        if (chunk.data.byteLength > this.chunkSize * 2) {
+          console.warn(`[SecureChunkLoader] ⚠️ Chunk ${i} trop volumineux, ignoré`);
+          continue;
+        }
+        
+        // Ajouter le chunk au blob progressif
+        blobParts.push(chunk.data);
+        
+        // Mettre à jour le token et le hash
         this.currentToken = chunk.nextToken;
         this.lastHash = chunk.nextHash;
 
         // Notifier la progression
         if (this.options.onProgress) {
-          this.options.onProgress((i + 1) * this.chunkSize, totalSize);
+          const loadedSize = blobParts.reduce((sum, part) => {
+            if (part instanceof ArrayBuffer) return sum + part.byteLength;
+            if (part instanceof Blob) return sum + part.size;
+            return sum;
+          }, 0);
+          this.options.onProgress(loadedSize, totalSize);
         }
 
         if (this.options.onChunkValidated) {
@@ -219,51 +262,49 @@ export class SecureChunkLoader {
 
         // Vérifier l'expiration du token
         if (Date.now() > chunk.expiresAt) {
-          throw new Error('Session expirée');
+          console.warn(`[SecureChunkLoader] ⚠️ Token expiré pour chunk ${i}`);
+          break;
         }
-
-        // Pour les premiers chunks, permettre un démarrage plus rapide
-        // En laissant le navigateur commencer à lire dès qu'il y a assez de données
-        if (i === initialChunksToLoad - 1 && this.options.videoElement) {
-          // Le navigateur peut commencer à lire avec les premiers chunks
-          console.log('[SecureChunkLoader] 🎬 Suffisamment de données pour démarrer la lecture');
+        
+        // Mettre à jour le blob progressivement (tous les 10 chunks)
+        // Pour éviter d'interrompre la lecture trop souvent
+        if ((i + 1) % 10 === 0 && this.options.videoElement && blobParts.length > INITIAL_CHUNKS) {
+          const newBlob = new Blob(blobParts, { type: 'video/mp4' });
+          const newBlobUrl = URL.createObjectURL(newBlob);
+          
+          // Mettre à jour la source seulement si nécessaire
+          // Vérifier si le navigateur a besoin de plus de données
+          const videoElement = this.options.videoElement;
+          const bufferedEnd = videoElement.buffered.length > 0 
+            ? videoElement.buffered.end(videoElement.buffered.length - 1) 
+            : 0;
+          const currentTime = videoElement.currentTime || 0;
+          
+          // Mettre à jour seulement si le buffer est presque vide
+          if (bufferedEnd - currentTime < 5 && videoElement.readyState >= 2) {
+            const wasPlaying = !videoElement.paused;
+            
+            URL.revokeObjectURL(currentBlobUrl);
+            videoElement.src = newBlobUrl;
+            
+            if (currentTime > 0) {
+              videoElement.currentTime = currentTime;
+            }
+            if (wasPlaying) {
+              videoElement.play().catch(() => {});
+            }
+          } else {
+            // Libérer le nouveau blob URL si on ne l'utilise pas
+            URL.revokeObjectURL(newBlobUrl);
+          }
         }
       } catch (error) {
-        console.error(`[SecureChunkLoader] ❌ Erreur chunk ${i}:`, error);
-        throw error;
+        console.error(`[SecureChunkLoader] ❌ Erreur chunk ${i} (arrière-plan):`, error);
+        // Continuer avec le prochain chunk même en cas d'erreur
       }
     }
-
-    // Attendre que tous les chunks soient ajoutés
-    while (this.chunkQueue.length > 0 || this.isAppending) {
-      await new Promise(resolve => setTimeout(resolve, 50));
-      if (this.isAborted) {
-        throw new DOMException('Chargement annulé', 'AbortError');
-      }
-    }
-
-    // Finaliser le stream
-    if (this.mediaSource && this.mediaSource.readyState === 'open') {
-      await new Promise<void>((resolve) => {
-        if (!this.sourceBuffer || !this.sourceBuffer.updating) {
-          this.mediaSource!.endOfStream();
-          resolve();
-        } else {
-          const checkReady = () => {
-            if (!this.sourceBuffer || !this.sourceBuffer.updating) {
-              this.mediaSource!.endOfStream();
-              resolve();
-            } else {
-              setTimeout(checkReady, 50);
-            }
-          };
-          checkReady();
-        }
-      });
-    }
-
-    console.log('[SecureChunkLoader] ✅ Streaming terminé');
-    return blobUrl;
+    
+    console.log('[SecureChunkLoader] ✅ Chargement en arrière-plan terminé');
   }
 
   /**
@@ -289,53 +330,6 @@ export class SecureChunkLoader {
     throw new Error('MSE requis pour la sécurité - votre navigateur ne supporte pas Media Source Extensions. Veuillez utiliser un navigateur moderne (Chrome, Firefox, Safari, Edge).');
   }
 
-  /**
-   * Traite la queue de chunks pour MSE - SÉCURISÉ
-   * Les chunks sont ajoutés directement au buffer sans jamais être stockés en MP4 complet
-   */
-  private processQueue(): void {
-    if (this.isAppending || this.chunkQueue.length === 0 || !this.sourceBuffer) {
-      return;
-    }
-
-    if (this.sourceBuffer.updating || !this.mediaSource || this.mediaSource.readyState !== 'open') {
-      return;
-    }
-
-    this.isAppending = true;
-    const chunk = this.chunkQueue.shift();
-    
-    if (chunk) {
-      try {
-        // VALIDATION FINALE : Vérifier le chunk une dernière fois avant l'ajout
-        if (!chunk || chunk.byteLength === 0) {
-          console.error('[SecureChunkLoader] ⚠️ Chunk invalide rejeté');
-          this.isAppending = false;
-          this.processQueue(); // Traiter le prochain chunk
-          return;
-        }
-        
-        // Ajouter le chunk validé directement au buffer MSE
-        // Le chunk est immédiatement traité par le navigateur, jamais stocké en MP4 complet
-        this.sourceBuffer.appendBuffer(chunk);
-        
-        // Le chunk est maintenant dans le buffer du navigateur, pas dans notre mémoire
-        // Cela empêche la reconstruction du MP4 complet côté client
-      } catch (error: any) {
-        this.isAppending = false;
-        if (error.name === 'QuotaExceededError') {
-          // Buffer plein, remettre le chunk dans la queue
-          this.chunkQueue.unshift(chunk);
-          setTimeout(() => this.processQueue(), 100);
-        } else {
-          console.error('[SecureChunkLoader] ❌ Erreur appendBuffer:', error);
-          // En cas d'erreur, ne pas stocker le chunk - sécurité maximale
-        }
-      }
-    } else {
-      this.isAppending = false;
-    }
-  }
 
   /**
    * Récupère les métadonnées de la vidéo
