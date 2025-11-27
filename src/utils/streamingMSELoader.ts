@@ -183,26 +183,24 @@ export class StreamingMSELoader {
   }
 
   /**
-   * Démarre le chargement des segments en parallèle
+   * Démarre le chargement des segments séquentiellement
+   * IMPORTANT: Le serveur exige un chargement séquentiel (0, 1, 2, 3...)
+   * On ne peut pas charger en parallèle car cela casse la séquence
    */
   private async startLoading(): Promise<void> {
-    // Charger les premiers segments rapidement pour démarrer la lecture
+    // Charger les premiers segments séquentiellement pour démarrer la lecture
     const initialSegments = Math.min(5, this.totalChunks);
     
-    console.log(`[StreamingMSE] 📦 Chargement des ${initialSegments} premiers segments...`);
+    console.log(`[StreamingMSE] 📦 Chargement séquentiel des ${initialSegments} premiers segments...`);
     
-    // Charger les segments initiaux en parallèle
-    const initialPromises: Promise<void>[] = [];
+    // Charger les segments initiaux SÉQUENTIELLEMENT (pas en parallèle)
     for (let i = 0; i < initialSegments; i++) {
-      initialPromises.push(this.loadSegment(i));
+      await this.loadSegment(i);
+      // Traiter la file d'attente après chaque segment pour les ajouter au SourceBuffer
+      this.processSegmentQueue();
     }
     
-    await Promise.all(initialPromises);
-    
-    console.log(`[StreamingMSE] ✅ ${initialSegments} segments initiaux chargés, traitement de la file d'attente...`);
-    
-    // Traiter la file d'attente pour ajouter les segments au SourceBuffer
-    this.processSegmentQueue();
+    console.log(`[StreamingMSE] ✅ ${initialSegments} segments initiaux chargés`);
     
     // Continuer le chargement en arrière-plan
     this.continueLoading();
@@ -210,59 +208,41 @@ export class StreamingMSELoader {
 
   /**
    * Continue le chargement des segments restants
+   * IMPORTANT: Chargement SÉQUENTIEL pour respecter la séquence du serveur
    */
   private async continueLoading(): Promise<void> {
-    let lastLoadedChunk = -1;
+    // Trouver le prochain segment à charger (séquentiellement)
+    let nextChunkToLoad = 0;
     
-    while (this.loadedChunks < this.totalChunks && !this.isAborted && !this.options.signal?.aborted) {
-      // Trouver le prochain segment à charger (le plus petit index non chargé)
-      let nextChunkToLoad = -1;
-      for (let i = 0; i < this.totalChunks; i++) {
-        if (!this.loadedSegments.has(i) && !this.loadingChunks.has(i)) {
-          nextChunkToLoad = i;
-          break;
-        }
+    while (nextChunkToLoad < this.totalChunks && !this.isAborted && !this.options.signal?.aborted) {
+      // Trouver le prochain segment non chargé (dans l'ordre)
+      while (nextChunkToLoad < this.totalChunks && 
+             (this.loadedSegments.has(nextChunkToLoad) || this.loadingChunks.has(nextChunkToLoad))) {
+        nextChunkToLoad++;
       }
 
-      // Si aucun segment à charger, attendre un peu
-      if (nextChunkToLoad === -1) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        continue;
+      // Si tous les segments sont chargés ou en cours, sortir
+      if (nextChunkToLoad >= this.totalChunks) {
+        break;
       }
 
-      // Calculer combien de segments charger en parallèle
-      const segmentsToLoad = Math.min(
-        this.maxConcurrentRequests - this.loadingChunks.size,
-        this.totalChunks - nextChunkToLoad
-      );
-
-      // Charger les segments en parallèle
-      const loadPromises: Promise<void>[] = [];
-      for (let i = 0; i < segmentsToLoad; i++) {
-        const chunkIndex = nextChunkToLoad + i;
-        if (chunkIndex < this.totalChunks && !this.loadedSegments.has(chunkIndex) && !this.loadingChunks.has(chunkIndex)) {
-          loadPromises.push(this.loadSegment(chunkIndex));
-        }
-      }
-
-      if (loadPromises.length > 0) {
-        await Promise.all(loadPromises);
-      }
-
-      // Traiter la file d'attente après chaque chargement
+      // Charger le segment SÉQUENTIELLEMENT
+      await this.loadSegment(nextChunkToLoad);
+      
+      // Traiter la file d'attente pour ajouter les segments au SourceBuffer
       this.processSegmentQueue();
 
       // Vérifier si on doit charger plus de segments
       const bufferAhead = this.getBufferAhead();
-      if (bufferAhead > 30 && this.loadedChunks > lastLoadedChunk + 5) {
-        // Buffer suffisant et on a chargé plusieurs segments, attendre un peu
-        await new Promise(resolve => setTimeout(resolve, 200));
+      if (bufferAhead > 30) {
+        // Buffer suffisant, attendre un peu avant de charger le prochain
+        await new Promise(resolve => setTimeout(resolve, 100));
       } else {
-        // Buffer faible ou on vient de charger, continuer rapidement
-        await new Promise(resolve => setTimeout(resolve, 50));
+        // Buffer faible, continuer rapidement
+        await new Promise(resolve => setTimeout(resolve, 10));
       }
 
-      lastLoadedChunk = this.loadedChunks;
+      nextChunkToLoad++;
     }
 
     // Tous les segments sont chargés, fermer MediaSource
