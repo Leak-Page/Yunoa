@@ -63,9 +63,9 @@ export const useVideoStream = (options: UseVideoStreamOptions) => {
         securityManagerRef.current = new VideoSecurityManager();
       }
 
-      // Load video securely using direct streaming (like Netflix)
+      // Load video securely using micro-chunks
       const sessionToken = session.access_token;
-      const streamUrl = await securityManagerRef.current.loadSecureVideo({
+      const blobUrl = await securityManagerRef.current.loadSecureVideo({
         videoUrl: url,
         videoId: videoId,
         sessionToken,
@@ -78,7 +78,7 @@ export const useVideoStream = (options: UseVideoStreamOptions) => {
       const qualities: VideoQuality[] = [
         {
           label: 'Sécurisé',
-          url: streamUrl,
+          url: blobUrl,
           bitrate: 2000,
           resolution: '720p'
         }
@@ -99,11 +99,8 @@ export const useVideoStream = (options: UseVideoStreamOptions) => {
         isLoading: false
       }));
 
-      // Set video source with direct streaming URL (no blob)
-      videoRef.current.src = streamUrl;
-      
-      // Le navigateur gère automatiquement le streaming avec Range requests
-      // Pas besoin de blob - chargement direct sécurisé
+      // Set video source with secure blob URL
+      videoRef.current.src = blobUrl;
 
       // Start buffer monitoring
       videoStreamService.createBufferMonitor(videoRef.current, videoId);

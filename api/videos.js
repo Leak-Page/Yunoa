@@ -22,98 +22,6 @@ const supabase = createClient(
 const secureStreams = new Map();
 const chunkCache = new Map();
 
-// Sessions de streaming direct sécurisé (comme Netflix)
-const streamingSessions = new Map();
-
-/**
- * Génère un hash SHA-256
- */
-function generateHash(data) {
-  return crypto.createHash('sha256').update(data).digest('hex');
-}
-
-/**
- * Génère un token de session de streaming temporaire (valide 60 secondes)
- */
-function generateStreamingSessionToken(userId, videoId) {
-  const sessionId = generateHash(`${userId}:${videoId}:${Date.now()}`);
-  const expiresAt = Date.now() + 60 * 1000; // 60 secondes
-  
-  const token = jwt.sign({
-    userId,
-    videoId,
-    sessionId,
-    timestamp: Date.now()
-  }, JWT_SECRET, { expiresIn: '60s' });
-  
-  return { token, sessionId, expiresAt };
-}
-
-/**
- * Valide une session de streaming et vérifie les abus
- */
-function validateStreamingSession(token, videoId, rangeStart, rangeEnd) {
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    
-    if (decoded.videoId !== videoId) {
-      return { valid: false, reason: 'VIDEO_ID_MISMATCH' };
-    }
-    
-    const session = streamingSessions.get(decoded.sessionId);
-    if (!session) {
-      return { valid: false, reason: 'SESSION_NOT_FOUND' };
-    }
-    
-    if (Date.now() > session.expiresAt) {
-      streamingSessions.delete(decoded.sessionId);
-      return { valid: false, reason: 'SESSION_EXPIRED' };
-    }
-    
-    // Vérifier les abus de téléchargement
-    const now = Date.now();
-    const timeSinceLastRequest = now - (session.lastRequestTime || session.createdAt);
-    const bytesRequested = (rangeEnd || 0) - (rangeStart || 0);
-    
-    // Détecter téléchargement : trop de données demandées trop rapidement
-    if (bytesRequested > 10 * 1024 * 1024 && timeSinceLastRequest < 1000) {
-      // Plus de 10MB en moins d'1 seconde = probable téléchargement
-      session.suspiciousActivity = (session.suspiciousActivity || 0) + 1;
-      if (session.suspiciousActivity >= 3) {
-        streamingSessions.delete(decoded.sessionId);
-        return { valid: false, reason: 'SUSPICIOUS_ACTIVITY' };
-      }
-    }
-    
-    // Vérifier la séquence des requêtes Range (doit être progressive)
-    if (rangeStart !== undefined && session.lastRangeEnd !== undefined) {
-      // Permettre un petit chevauchement (buffer) mais pas de grands sauts
-      const gap = rangeStart - session.lastRangeEnd;
-      if (gap > 5 * 1024 * 1024) { // Plus de 5MB de gap = suspect
-        session.suspiciousActivity = (session.suspiciousActivity || 0) + 1;
-        if (session.suspiciousActivity >= 2) {
-          return { valid: false, reason: 'INVALID_RANGE_SEQUENCE' };
-        }
-      }
-    }
-    
-    // Limiter la taille maximale d'un chunk (empêcher téléchargement complet)
-    if (bytesRequested > 20 * 1024 * 1024) { // Max 20MB par requête
-      return { valid: false, reason: 'CHUNK_TOO_LARGE' };
-    }
-    
-    // Mettre à jour la session
-    session.lastRequestTime = now;
-    session.lastRangeStart = rangeStart;
-    session.lastRangeEnd = rangeEnd;
-    session.requestCount = (session.requestCount || 0) + 1;
-    
-    return { valid: true, session, decoded };
-  } catch (error) {
-    return { valid: false, reason: 'INVALID_TOKEN' };
-  }
-}
-
 // Nettoyage automatique
 setInterval(() => {
   const now = Date.now();
@@ -128,13 +36,14 @@ setInterval(() => {
       chunkCache.delete(key);
     }
   }
-  // Nettoyer les sessions de streaming expirées
-  for (const [sessionId, session] of streamingSessions.entries()) {
-    if (now > session.expiresAt) {
-      streamingSessions.delete(sessionId);
-    }
-  }
 }, 60 * 1000);
+
+/**
+ * Génère un hash SHA-256
+ */
+function generateHash(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
 
 /**
  * Génère un token unique avec timestamp
@@ -330,6 +239,9 @@ export default async (req, res) => {
       const sessionId = generateHash(`${user.id}:${videoId}:${fingerprint}:${Date.now()}`);
       const expiresAt = Date.now() + 4 * 60 * 60 * 1000; // 4 heures
       const encryptionSeed = generateHash(`${sessionId}:${Date.now()}`);
+      
+      // Taille de chunk par défaut : 1MB pour un chargement plus rapide
+      const defaultChunkSize = 1024 * 1024; // 1MB
 
       const sessionCreatedAt = Date.now();
       secureStreams.set(sessionId, {
@@ -343,7 +255,8 @@ export default async (req, res) => {
         createdAt: sessionCreatedAt,
         lastHash: null,
         encryptionSeed,
-        useMSE: useMSE || false
+        useMSE: useMSE || false,
+        chunkSize: defaultChunkSize // Stocker la taille de chunk dans la session
       });
       
       console.log(`✅ Session créée: ${sessionId.substring(0, 16)}... pour user ${user.id}, video ${videoId}`);
@@ -358,8 +271,8 @@ export default async (req, res) => {
         size = 100 * 1024 * 1024; // 100 MB par défaut
       }
 
-      const chunkSize = 512 * 1024;
-      const totalChunks = Math.ceil(size / chunkSize);
+      // Calculer le nombre total de chunks avec la taille de chunk de la session
+      const totalChunks = Math.ceil(size / (session.chunkSize || 1024 * 1024));
 
       return res.json({
         sessionId,
@@ -495,7 +408,8 @@ export default async (req, res) => {
       }
 
       // Récupérer le chunk de la vidéo
-       const chunkSize = 512 * 1024; // 512 KB
+       // Utiliser la taille de chunk de la session (1MB par défaut)
+       const chunkSize = session.chunkSize || 1024 * 1024; // 1MB par défaut
        const start = chunkIndex * chunkSize;
        const end = start + chunkSize - 1;
 
@@ -570,327 +484,6 @@ export default async (req, res) => {
        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
        return res.end(Buffer.from(chunkData));
-    }
-    
-    // POST /api/videos/stream/session - Créer une session de streaming sécurisée
-    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && pathParts[3] === 'session' && req.method === 'POST') {
-      try {
-        // Parser le body si nécessaire (pour Vercel/Serverless)
-        let body = req.body;
-        if (typeof body === 'string') {
-          try {
-            body = JSON.parse(body);
-          } catch (e) {
-            return res.status(400).json({ error: 'Body JSON invalide' });
-          }
-        }
-        
-        let user;
-        try {
-          user = authenticateToken(req);
-        } catch (authError) {
-          console.error('Erreur authentification session:', authError.message);
-          return res.status(401).json({ 
-            error: 'Authentification requise',
-            details: authError.message 
-          });
-        }
-        
-        if (!user || !user.id) {
-          console.error('Utilisateur non authentifié:', user);
-          return res.status(401).json({ error: 'Utilisateur non authentifié' });
-        }
-        
-        const videoId = body?.videoId;
-        
-        if (!videoId) {
-          console.error('VideoId manquant dans body:', body);
-          return res.status(400).json({ error: 'ID de vidéo requis' });
-        }
-        
-        // Vérifier les streams simultanés
-        try {
-          const streamCheck = checkConcurrentStreams(user.id, videoId);
-          if (!streamCheck.allowed) {
-            return res.status(429).json({
-              error: streamCheck.message,
-              code: 'TOO_MANY_STREAMS'
-            });
-          }
-        } catch (streamError) {
-          console.error('Erreur vérification streams:', streamError);
-          // Continuer même en cas d'erreur de vérification
-        }
-        
-        // Créer une session de streaming sécurisée
-        try {
-          const { token, sessionId, expiresAt } = generateStreamingSessionToken(user.id, videoId);
-          
-          streamingSessions.set(sessionId, {
-            userId: user.id,
-            videoId,
-            createdAt: Date.now(),
-            expiresAt,
-            lastRequestTime: Date.now(),
-            requestCount: 0,
-            suspiciousActivity: 0
-          });
-          
-          res.json({
-            sessionToken: token,
-            expiresIn: 60, // 60 secondes
-            refreshInterval: 30 // Renouveler toutes les 30 secondes
-          });
-        } catch (tokenError) {
-          console.error('Erreur génération token session:', tokenError);
-          return res.status(500).json({ 
-            error: 'Erreur création session',
-            details: tokenError.message 
-          });
-        }
-      } catch (error) {
-        console.error('Erreur endpoint session streaming:', error);
-        return res.status(500).json({ 
-          error: 'Erreur serveur',
-          details: error.message 
-        });
-      }
-    }
-    
-    // GET /api/videos/stream/:videoId - Streaming direct sécurisé (comme Netflix)
-    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && req.method === 'GET') {
-      const videoId = pathParts[3];
-      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
-      const token = req.headers.authorization?.replace('Bearer ', '') || searchParams.get('token');
-      
-      if (!token) {
-        return res.status(401).json({ error: 'Token d\'authentification requis' });
-      }
-
-      try {
-        // Créer une requête modifiée avec le token dans les headers pour authenticateToken
-        const modifiedReq = {
-          ...req,
-          headers: {
-            ...req.headers,
-            authorization: `Bearer ${token}`
-          }
-        };
-        
-        let user;
-        try {
-          user = authenticateToken(modifiedReq);
-        } catch (authError) {
-          console.error('Erreur authentification token:', authError.message);
-          // Essayer de décoder le token pour debug
-          try {
-            const decoded = jwt.decode(token, { complete: true });
-            console.log('Token décodé:', decoded ? 'OK' : 'FAILED', decoded?.payload ? 'Payload présent' : 'Pas de payload');
-            if (decoded?.payload) {
-              console.log('Payload iss:', decoded.payload.iss);
-              console.log('Payload sub:', decoded.payload.sub);
-              console.log('Payload email:', decoded.payload.email);
-            }
-          } catch (e) {
-            console.error('Impossible de décoder le token:', e.message);
-          }
-          return res.status(401).json({ 
-            error: 'Token d\'authentification invalide',
-            details: authError.message 
-          });
-        }
-        
-        const clientIp = getClientIp(req);
-        
-        // Vérifier les abus
-        const abuseCheck = detectAbusePatterns(user.id, videoId);
-        if (abuseCheck.isAbuse) {
-          logSuspiciousActivity('ABUSE_DETECTED', { 
-            userId: user.id, 
-            videoId, 
-            reason: abuseCheck.reason,
-            ip: clientIp 
-          });
-          return res.status(429).json({ 
-            error: 'Trop de requêtes détectées',
-            code: 'RATE_LIMITED' 
-          });
-        }
-        
-        // Vérifier les streams simultanés
-        const streamCheck = checkConcurrentStreams(user.id, videoId);
-        if (!streamCheck.allowed) {
-          return res.status(429).json({ 
-            error: streamCheck.message,
-            code: 'TOO_MANY_STREAMS' 
-          });
-        }
-
-        // Récupérer l'URL de la vidéo ou de l'épisode
-        let videoUrl = null;
-        let videoTitle = null;
-        
-        // Essayer d'abord comme vidéo
-        const { data: video, error: videoError } = await supabase
-          .from('videos')
-          .select('video_url, title')
-          .eq('id', videoId)
-          .single();
-
-        if (video && !videoError) {
-          videoUrl = video.video_url;
-          videoTitle = video.title;
-        } else {
-          // Si ce n'est pas une vidéo, essayer comme épisode
-          const { data: episode, error: episodeError } = await supabase
-            .from('episodes')
-            .select('video_url, title')
-            .eq('id', videoId)
-            .single();
-
-          if (episode && !episodeError) {
-            videoUrl = episode.video_url;
-            videoTitle = episode.title;
-          } else {
-            return res.status(404).json({ error: 'Vidéo ou épisode non trouvé' });
-          }
-        }
-
-        if (!videoUrl) {
-          return res.status(404).json({ error: 'URL vidéo non trouvée' });
-        }
-
-        // Obtenir les headers Range si présents (pour le streaming progressif)
-        const range = req.headers.range;
-        
-        // Faire une requête HEAD pour obtenir les métadonnées de la vidéo
-        const headResponse = await fetch(videoUrl, { method: 'HEAD' });
-        const contentLength = parseInt(headResponse.headers.get('content-length') || '0');
-        const contentType = headResponse.headers.get('content-type') || 'video/mp4';
-        const acceptRanges = headResponse.headers.get('accept-ranges') || 'bytes';
-
-        if (range) {
-          // Streaming avec Range request (progressive)
-          const parts = range.replace(/bytes=/, '').split('-');
-          const start = parseInt(parts[0], 10);
-          const end = parts[1] ? parseInt(parts[1], 10) : contentLength - 1;
-          const chunksize = (end - start) + 1;
-          
-          // SÉCURITÉ : Valider la session et détecter les téléchargements
-          // Le token peut être soit un token de session temporaire, soit le token Supabase
-          // On essaie d'abord avec validateStreamingSession, sinon on utilise authenticateToken
-          let sessionValidation = validateStreamingSession(token, videoId, start, end);
-          
-          if (!sessionValidation.valid && sessionValidation.reason === 'SESSION_NOT_FOUND') {
-            // Si pas de session trouvée, c'est peut-être un token Supabase direct
-            // On crée une session à la volée pour cette requête
-            try {
-              const { token: newSessionToken, sessionId, expiresAt } = generateStreamingSessionToken(user.id, videoId);
-              streamingSessions.set(sessionId, {
-                userId: user.id,
-                videoId,
-                createdAt: Date.now(),
-                expiresAt,
-                lastRequestTime: Date.now(),
-                requestCount: 0,
-                suspiciousActivity: 0
-              });
-              // Réessayer la validation avec le nouveau token
-              sessionValidation = validateStreamingSession(newSessionToken, videoId, start, end);
-            } catch (e) {
-              // Ignorer et continuer avec les validations de base
-            }
-          }
-          
-          // Valider les requêtes suspectes même si la session n'existe pas
-          const bytesRequested = chunksize;
-          if (bytesRequested > 20 * 1024 * 1024) { // Max 20MB par requête
-            logSuspiciousActivity('LARGE_CHUNK_REQUEST', {
-              userId: user.id,
-              videoId,
-              ip: clientIp,
-              size: bytesRequested
-            });
-            return res.status(403).json({
-              error: 'Chunk trop volumineux',
-              code: 'CHUNK_TOO_LARGE'
-            });
-          }
-
-          // Récupérer le chunk de la vidéo
-          const videoResponse = await fetch(videoUrl, {
-            headers: {
-              'Range': `bytes=${start}-${end}`
-            }
-          });
-
-          if (!videoResponse.ok) {
-            return res.status(502).json({ error: 'Erreur de récupération vidéo' });
-          }
-
-          const chunkData = await videoResponse.arrayBuffer();
-
-          // Envoyer la réponse avec les headers appropriés
-          res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${contentLength}`,
-            'Accept-Ranges': acceptRanges,
-            'Content-Length': chunksize,
-            'Content-Type': contentType,
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-            'X-Content-Type-Options': 'nosniff'
-          });
-
-          return res.end(Buffer.from(chunkData));
-        }
-
-          if (!videoResponse.ok) {
-            return res.status(502).json({ error: 'Erreur de récupération vidéo' });
-          }
-
-          // Copier les headers importants
-          res.writeHead(200, {
-            'Content-Length': contentLength,
-            'Content-Type': contentType,
-            'Accept-Ranges': acceptRanges,
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0',
-            'X-Content-Type-Options': 'nosniff'
-          });
-
-          // Streamer la vidéo directement
-          const reader = videoResponse.body.getReader();
-          const pump = async () => {
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                res.write(Buffer.from(value));
-              }
-              res.end();
-            } catch (error) {
-              console.error('Streaming error:', error);
-              if (!res.headersSent) {
-                res.status(500).json({ error: 'Erreur de streaming' });
-              } else {
-                res.end();
-              }
-            }
-          };
-
-          pump();
-          return;
-        }
-
-      } catch (authError) {
-        if (authError.message === 'Token manquant' || authError.message === 'Token invalide') {
-          return res.status(401).json({ error: 'Token d\'authentification invalide' });
-        }
-        console.error('Stream error:', authError);
-        return res.status(500).json({ error: 'Erreur serveur' });
-      }
     }
     
     else {

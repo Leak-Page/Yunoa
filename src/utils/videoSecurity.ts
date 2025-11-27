@@ -27,8 +27,7 @@ interface VideoLoadOptions {
 
 export class VideoSecurityManager {
   private config: VideoSecurityConfig;
-  private urlCache = new Map<string, string>(); // Cache des URLs de streaming (pas de blobs)
-  private sessionTokens = new Map<string, { token: string; expiresAt: number; refreshTimer?: NodeJS.Timeout }>(); // Tokens de session temporaires
+  private blobCache = new Map<string, string>();
 
   constructor(config: VideoSecurityConfig = {}) {
     this.config = {
@@ -40,9 +39,8 @@ export class VideoSecurityManager {
   }
 
   /**
-   * Charge une vidéo via streaming direct sécurisé (comme Netflix)
-   * Utilise des tokens temporaires avec rotation pour empêcher le téléchargement
-   * Pas de blob - chargement direct avec support Range requests
+   * Charge une vidéo via le système de micro-chunks sécurisé
+   * Empêche le téléchargement par extensions grâce à la validation continue
    */
   async loadSecureVideo(options: VideoLoadOptions): Promise<string> {
     const { videoUrl, videoId, sessionToken, onProgress, signal } = options;
@@ -50,123 +48,82 @@ export class VideoSecurityManager {
     // Clé de cache basée sur l'URL et l'ID
     const cacheKey = `${videoId}-${this.hashString(videoUrl)}`;
     
-    // Créer ou récupérer une session de streaming sécurisée
-    let sessionData = this.sessionTokens.get(cacheKey);
-    
-    if (!sessionData || Date.now() > sessionData.expiresAt) {
-      // Créer une nouvelle session
+    // Vérifier le cache
+    if (this.blobCache.has(cacheKey)) {
+      return this.blobCache.get(cacheKey)!;
+    }
+
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < this.config.maxRetries!; attempt++) {
       try {
-        const response = await fetch('/api/videos/stream/session', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${sessionToken}`
-          },
-          body: JSON.stringify({ videoId })
-        });
-        
-        if (!response.ok) {
-          throw new Error('Impossible de créer une session de streaming');
+        if (signal?.aborted) {
+          throw new DOMException('Chargement annulé', 'AbortError');
         }
-        
-        const data = await response.json();
-        const expiresAt = Date.now() + (data.expiresIn * 1000);
-        
-        sessionData = {
-          token: data.sessionToken,
-          expiresAt
-        };
-        
-        this.sessionTokens.set(cacheKey, sessionData);
-        
-        // Programmer le renouvellement du token (toutes les 30 secondes)
-        if (sessionData.refreshTimer) {
-          clearInterval(sessionData.refreshTimer);
-        }
-        
-        sessionData.refreshTimer = setInterval(async () => {
-          try {
-            const refreshResponse = await fetch('/api/videos/stream/session', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${sessionToken}`
-              },
-              body: JSON.stringify({ videoId })
-            });
-            
-            if (refreshResponse.ok) {
-              const refreshData = await refreshResponse.json();
-              const newExpiresAt = Date.now() + (refreshData.expiresIn * 1000);
-              
-              const currentSession = this.sessionTokens.get(cacheKey);
-              if (currentSession) {
-                currentSession.token = refreshData.sessionToken;
-                currentSession.expiresAt = newExpiresAt;
-              }
-              
-              console.log('🔄 Token de streaming renouvelé');
+
+        // Utiliser le système de micro-chunks avec validation continue
+        // Note: videoElement sera passé depuis VideoPlayerComponent si disponible
+        const loader = new SecureChunkLoader({
+          videoUrl,
+          videoId,
+          sessionToken,
+          onProgress: (loaded, total) => {
+            if (onProgress && total > 0) {
+              onProgress((loaded / total) * 100);
             }
-          } catch (error) {
-            console.error('Erreur renouvellement token:', error);
-          }
-        }, (data.refreshInterval || 30) * 1000);
-        
+          },
+          onChunkValidated: (index) => {
+            console.log(`🔒 Chunk ${index} validé`);
+          },
+          signal
+        });
+
+        const blobUrl = await loader.load();
+
+        // Mettre en cache
+        this.blobCache.set(cacheKey, blobUrl);
+
+        // Log sécurisé sans exposer d'informations sensibles
+        console.log('✅ Vidéo chargée avec validation continue');
+
+        return blobUrl;
+
       } catch (error) {
-        console.error('Erreur création session streaming:', error);
-        // Fallback : utiliser le token de session directement (moins sécurisé)
-        const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionToken)}`;
-        this.urlCache.set(cacheKey, streamUrl);
-        return streamUrl;
+        lastError = error as Error;
+        console.error(`Tentative ${attempt + 1} échouée:`, error.message);
+
+        if (attempt < this.config.maxRetries! - 1) {
+          await new Promise(resolve => setTimeout(resolve, this.config.retryDelay! * (attempt + 1)));
+        }
       }
     }
 
-    // Générer l'URL de streaming avec le token de session temporaire
-    const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionData.token)}`;
-    
-    // Mettre en cache l'URL (pas de blob)
-    this.urlCache.set(cacheKey, streamUrl);
-
-    // Log sécurisé
-    console.log('✅ URL de streaming direct générée (sécurisé comme Netflix avec rotation de tokens)');
-
-    // Si onProgress est fourni, simuler la progression (le navigateur gère le streaming)
-    if (onProgress) {
-      // La progression sera gérée par le navigateur via les événements vidéo
-      // On peut déclencher un événement initial
-      setTimeout(() => {
-        onProgress(0);
-      }, 100);
-    }
-
-    return streamUrl;
+    throw lastError || new Error('Échec du chargement après plusieurs tentatives');
   }
 
   /**
-   * Libère les ressources du cache
-   * Note: Plus besoin de révoquer des blobs car on utilise des URLs directes
+   * Libère les ressources blob du cache
+   * SÉCURITÉ : Révoque tous les blob URLs pour empêcher le téléchargement
    */
   cleanup(): void {
-    // Nettoyer les timers de renouvellement
-    for (const sessionData of this.sessionTokens.values()) {
-      if (sessionData.refreshTimer) {
-        clearInterval(sessionData.refreshTimer);
-      }
+    for (const blobUrl of this.blobCache.values()) {
+      // SÉCURITÉ : Révoquer immédiatement les blob URLs
+      // Empêche l'accès aux données après la lecture
+      URL.revokeObjectURL(blobUrl);
     }
-    
-    this.urlCache.clear();
-    this.sessionTokens.clear();
-    console.log('[VideoSecurityManager] 🧹 Cache des URLs et sessions nettoyé');
+    this.blobCache.clear();
+    console.log('[VideoSecurityManager] 🧹 Tous les blobs révoqués - sécurité maximale');
   }
 
   /**
-   * Libère une URL spécifique du cache
+   * Libère une ressource blob spécifique
    */
-  releaseUrl(url: string): void {
+  releaseBlobUrl(blobUrl: string): void {
+    URL.revokeObjectURL(blobUrl);
     // Retirer du cache
-    for (const [key, cachedUrl] of this.urlCache.entries()) {
-      if (cachedUrl === url) {
-        this.urlCache.delete(key);
+    for (const [key, url] of this.blobCache.entries()) {
+      if (url === blobUrl) {
+        this.blobCache.delete(key);
         break;
       }
     }

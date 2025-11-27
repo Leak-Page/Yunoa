@@ -655,8 +655,8 @@ const VideoPlayerComponent = () => {
         }
       }
 
-      // Charger la vidéo de manière sécurisée avec streaming direct (comme Netflix)
-      console.log('[VideoPlayer] 🎬 Démarrage du streaming direct sécurisé pour videoId:', videoId);
+      // Charger la vidéo de manière sécurisée avec streaming progressif
+      console.log('[VideoPlayer] 🎬 Démarrage du streaming sécurisé pour videoId:', videoId);
       
       if (!secManagerRef.current) {
         secManagerRef.current = new VideoSecurityManager();
@@ -669,32 +669,30 @@ const VideoPlayerComponent = () => {
         videoElement.addEventListener("error", handleVideoError, { once: true });
         videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true });
         videoElement.addEventListener("canplay", handleCanPlay, { once: true });
-        videoElement.addEventListener("progress", () => {
-          // Mettre à jour le buffer progressivement
-          if (videoElement.buffered.length > 0) {
-            const bufferedEnd = videoElement.buffered.end(videoElement.buffered.length - 1);
-            const duration = videoElement.duration || 1;
-            const bufferedPercent = (bufferedEnd / duration) * 100;
-            setBuffered(bufferedPercent);
-          }
-        });
 
-        // Charger la vidéo via streaming direct (pas de blob)
-        const streamUrl = await secManagerRef.current.loadSecureVideo({
+        // Charger la vidéo via le système sécurisé avec streaming MSE
+        // On passe directement le loader avec l'élément vidéo pour le streaming progressif
+        const { SecureChunkLoader } = await import('@/utils/secureChunkLoader');
+        const loader = new SecureChunkLoader({
           videoUrl,
           videoId,
           sessionToken: token,
+          videoElement, // Passer l'élément vidéo pour activer le streaming MSE
           onProgress: (progress) => {
             setBuffered(progress);
             console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progress)}%`);
           }
         });
+
+        const blobUrl = await loader.load();
         
-        // Définir la source directement (le navigateur gère le streaming avec Range requests)
-        videoElement.src = streamUrl;
-        await videoElement.load();
+        // Si ce n'est pas déjà fait par MSE, définir la source
+        if (!videoElement.src || !videoElement.src.startsWith('blob:')) {
+          videoElement.src = blobUrl;
+          await videoElement.load();
+        }
         
-        console.log('[VideoPlayer] ✅ Streaming direct démarré avec succès (pas de blob)');
+        console.log('[VideoPlayer] ✅ Streaming démarré avec succès');
         setIsBuffering(false);
         
       } catch (error) {

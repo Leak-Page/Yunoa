@@ -23,8 +23,8 @@ function authenticateToken(req) {
     // Si c'est un token Supabase, on fait une validation simple
     if (payload.iss && payload.iss.includes('supabase')) {
       // Validation basique pour Supabase
-      if (!payload.sub) {
-        throw new Error('Token Supabase invalide: sub manquant');
+      if (!payload.sub || !payload.email) {
+        throw new Error('Token Supabase invalide');
       }
       
       // Vérifier l'expiration
@@ -33,14 +33,11 @@ function authenticateToken(req) {
       }
       
       // Retourner un objet compatible
-      // L'email peut être dans payload.email ou payload.user_metadata.email
-      const email = payload.email || payload.user_metadata?.email || '';
-      
       return {
         id: payload.sub,
         userId: payload.sub,
-        email: email,
-        role: payload.role || payload.user_metadata?.role || 'membre'
+        email: payload.email,
+        role: payload.user_metadata?.role || 'membre'
       };
     } else {
       // Token legacy
