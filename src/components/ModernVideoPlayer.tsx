@@ -11,8 +11,7 @@ import { useAuth } from '../context/AuthContext';
 import { useVideo } from '../context/VideoContext';
 import { apiService } from '../services/ApiService';
 import { useVideoProtection } from '../utils/videoSecurity';
-import { useVideoStream } from '../hooks/useVideoStream';
-import { videoStreamService, BufferState } from '../services/VideoStreamService';
+import { supabase } from '@/integrations/supabase/client';
 import SecureDRMPlayer from './SecureDRMPlayer';
 
 const ModernVideoPlayer = () => {
@@ -41,7 +40,6 @@ const ModernVideoPlayer = () => {
   const [showSubtitleMenu, setShowSubtitleMenu] = useState(false);
   
   // Streaming state
-  const [bufferState, setBufferState] = useState<BufferState | null>(null);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
   const [loadingProgress, setLoadingProgress] = useState(0);
   
@@ -59,25 +57,11 @@ const ModernVideoPlayer = () => {
   const currentVideoUrl = currentEpisode ? currentEpisode.video_url : video?.video_url;
   const currentVideoId = currentEpisode ? currentEpisode.id : video?.id;
   
-  // Initialize video streaming
-  const {
-    videoRef,
-    state: streamState,
-    initializeStream,
-    changeQuality,
-    loadWithProgress
-  } = useVideoStream({
-    videoId: currentVideoId || '',
-    url: currentVideoUrl || '',
-    autoQuality: true,
-    preload: 'metadata',
-    onBufferUpdate: (state) => {
-      setBufferState(state);
-    },
-    onError: (error) => {
-      console.error('Video stream error:', error);
-    }
-  });
+  // Video element ref
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const loaderRef = useRef<{ cleanup: () => void } | null>(null);
+  const [isLoadingVideo, setIsLoadingVideo] = useState(false);
+  const [videoError, setVideoError] = useState<Error | null>(null);
 
   // Security hook
   useVideoProtection(true); // Active la protection anti-inspection
@@ -97,6 +81,15 @@ const ModernVideoPlayer = () => {
       loadSubtitles();
     }
   }, [user, video]);
+
+  // Cleanup loader on unmount
+  useEffect(() => {
+    return () => {
+      if (loaderRef.current) {
+        loaderRef.current.cleanup();
+      }
+    };
+  }, []);
 
   // Auto-save progress every 30 seconds
   useEffect(() => {
@@ -132,9 +125,72 @@ const ModernVideoPlayer = () => {
           .filter(v => v.id !== id && v.category === videoData.category)
           .slice(0, 8);
         setRelatedVideos(related);
+        
+        // Charger la vidéo après avoir récupéré les données
+        if (videoRef.current && user) {
+          await loadVideoSource(videoData.video_url, videoData.id);
+        }
       }
     } catch (error) {
       console.error('Erreur lors du chargement de la vidéo:', error);
+    }
+  };
+
+  const loadVideoSource = async (videoUrl: string, videoId: string) => {
+    if (!videoUrl || !videoRef.current || !user) return;
+
+    try {
+      setIsLoadingVideo(true);
+      setVideoError(null);
+
+      const session = await supabase.auth.getSession();
+      const token = session.data.session?.access_token;
+
+      if (!token) {
+        throw new Error('Token d\'authentification manquant');
+      }
+
+      const videoElement = videoRef.current;
+
+      // Nettoyer l'ancien loader
+      if (loaderRef.current) {
+        loaderRef.current.cleanup();
+        loaderRef.current = null;
+      }
+
+      // Charger via SecureChunkLoader (HLS en priorité)
+      const { SecureChunkLoader } = await import('@/utils/secureChunkLoader');
+      const loader = new SecureChunkLoader({
+        videoUrl,
+        videoId,
+        sessionToken: token,
+        videoElement,
+        onProgress: (loaded, total) => {
+          const progress = total > 0 ? (loaded / total) * 100 : 0;
+          setLoadingProgress(progress);
+        },
+        onError: (error) => {
+          console.error('[ModernVideoPlayer] ❌ Erreur:', error);
+          setVideoError(error);
+        }
+      });
+
+      loaderRef.current = loader;
+      const sourceUrl = await loader.load();
+
+      // Pour HLS, la source est déjà définie par HLS.js
+      // Pour le fallback, on définit la source manuellement
+      if (!videoElement.src || (!videoElement.src.startsWith('blob:') && !videoElement.src.includes('.m3u8'))) {
+        videoElement.src = sourceUrl;
+        await videoElement.load();
+      }
+
+      setIsLoadingVideo(false);
+
+    } catch (error) {
+      console.error('[ModernVideoPlayer] ❌ Erreur chargement vidéo:', error);
+      setVideoError(error instanceof Error ? error : new Error('Erreur de chargement'));
+      setIsLoadingVideo(false);
     }
   };
 
@@ -247,7 +303,6 @@ const ModernVideoPlayer = () => {
     }
   };
 
-  // This function is no longer needed as streaming is handled by useVideoStream hook
 
   const togglePlay = () => {
     const videoElement = videoRef.current;
@@ -319,7 +374,7 @@ const ModernVideoPlayer = () => {
       {/* Hero Video Section */}
       <div className="relative h-[60vh] overflow-hidden">
         {/* Video Player ou Thumbnail */}
-        {streamState.currentQuality && !streamState.isLoading ? (
+        {videoRef.current && !isLoadingVideo ? (
           <div className="relative w-full h-full">
             <video
               ref={videoRef}
@@ -372,25 +427,12 @@ const ModernVideoPlayer = () => {
               )}
             </video>
             
-            {/* Buffer indicator */}
-            {bufferState && (
+            {/* Loading progress indicator */}
+            {loadingProgress > 0 && loadingProgress < 100 && (
               <div className="absolute top-4 right-4 flex items-center space-x-2 bg-black/70 px-3 py-2 rounded-lg">
-                {bufferState.health === 'critical' ? (
-                  <WifiOff className="w-4 h-4 text-red-400" />
-                ) : (
-                  <Wifi className="w-4 h-4 text-green-400" />
-                )}
+                <Wifi className="w-4 h-4 text-green-400" />
                 <span className="text-white text-sm">
-                  {Math.round(bufferState.bufferPercentage)}%
-                </span>
-              </div>
-            )}
-            
-            {/* Quality indicator */}
-            {streamState.currentQuality && (
-              <div className="absolute top-4 left-4 bg-black/70 px-3 py-2 rounded-lg">
-                <span className="text-white text-sm">
-                  {streamState.currentQuality.resolution}
+                  {Math.round(loadingProgress)}%
                 </span>
               </div>
             )}
@@ -403,12 +445,12 @@ const ModernVideoPlayer = () => {
           />
         )}
         
-        {/* Overlay de chargement amélioré */}
-        {streamState.isLoading && (
+        {/* Overlay de chargement */}
+        {isLoadingVideo && (
           <div className="absolute inset-0 bg-black/80 flex items-center justify-center">
             <div className="text-center text-white">
               <Loader2 className="w-12 h-12 animate-spin mx-auto mb-4" />
-              <p className="text-lg font-semibold">Optimisation du flux vidéo...</p>
+              <p className="text-lg font-semibold">Chargement de la vidéo...</p>
               {loadingProgress > 0 && (
                 <div className="mt-4 w-64 bg-gray-700 rounded-full h-2">
                   <div 
@@ -417,29 +459,23 @@ const ModernVideoPlayer = () => {
                   />
                 </div>
               )}
-              <p className="text-sm text-gray-300 mt-2">
-                Vitesse réseau: {bufferState?.networkSpeed.toFixed(1)} Mbps
-              </p>
             </div>
           </div>
         )}
 
-        {/* Indicateur de buffering */}
-        {streamState.isBuffering && (
-          <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2">
-            <Loader2 className="w-8 h-8 animate-spin text-white" />
-          </div>
-        )}
-
         {/* Erreur de chargement */}
-        {streamState.error && (
+        {videoError && (
           <div className="absolute inset-0 bg-black/80 flex items-center justify-center">
             <div className="text-center text-white">
               <Film className="w-16 h-16 text-red-500 mx-auto mb-4" />
               <h3 className="text-xl font-bold mb-2">Erreur de chargement</h3>
-              <p className="text-gray-300 mb-4">{streamState.error.message}</p>
+              <p className="text-gray-300 mb-4">{videoError.message}</p>
               <button
-                onClick={initializeStream}
+                onClick={() => {
+                  if (video) {
+                    loadVideoSource(video.video_url, video.id);
+                  }
+                }}
                 className="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded font-semibold"
               >
                 Réessayer
@@ -449,18 +485,11 @@ const ModernVideoPlayer = () => {
         )}
 
         {/* Custom Video Controls */}
-        {streamState.currentQuality && !streamState.isLoading && (
+        {videoRef.current && !isLoadingVideo && (
           <div className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black via-black/80 to-transparent p-6 transition-opacity duration-300 ${showControls ? 'opacity-100' : 'opacity-0'}`}>
-            {/* Progress Bar avec buffer indicator */}
+            {/* Progress Bar */}
             <div className="mb-4">
               <div className="w-full bg-gray-600 h-1 rounded-full cursor-pointer relative">
-                {/* Buffer progress */}
-                {bufferState && (
-                  <div 
-                    className="absolute bg-gray-400 h-1 rounded-full"
-                    style={{ width: `${bufferState.bufferPercentage}%` }}
-                  />
-                )}
                 {/* Playback progress */}
                 <div 
                   className="absolute bg-red-600 h-1 rounded-full transition-all duration-200 z-10"
@@ -678,7 +707,7 @@ const ModernVideoPlayer = () => {
                 </button>
               )}
               
-              {streamState.currentQuality && !streamState.isLoading ? (
+              {videoRef.current && !isLoadingVideo ? (
                 <button
                   onClick={togglePlay}
                   className="flex items-center space-x-2 bg-white hover:bg-gray-200 text-black px-8 py-3 rounded font-semibold transition-colors"
@@ -688,12 +717,16 @@ const ModernVideoPlayer = () => {
                 </button>
               ) : (
                 <button
-                  onClick={initializeStream}
-                  disabled={streamState.isLoading}
+                  onClick={() => {
+                    if (video) {
+                      loadVideoSource(video.video_url, video.id);
+                    }
+                  }}
+                  disabled={isLoadingVideo}
                   className="flex items-center space-x-2 bg-white hover:bg-gray-200 text-black px-8 py-3 rounded font-semibold transition-colors disabled:opacity-50"
                 >
-                  {streamState.isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
-                  <span>{streamState.isLoading ? 'Chargement...' : 'Charger la vidéo'}</span>
+                  {isLoadingVideo ? <Loader2 className="w-5 h-5 animate-spin" /> : <Play className="w-5 h-5 fill-current" />}
+                  <span>{isLoadingVideo ? 'Chargement...' : 'Charger la vidéo'}</span>
                 </button>
               )}
               

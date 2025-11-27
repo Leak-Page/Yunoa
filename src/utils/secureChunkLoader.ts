@@ -1,46 +1,24 @@
-import { clientFingerprint } from './clientFingerprint';
-import { StreamingMSELoader } from './streamingMSELoader';
-
 /**
- * Système de chargement par micro-chunks avec validation continue
- * Utilise le nouveau StreamingMSELoader pour un streaming optimal
- * Rend le téléchargement par extensions extrêmement difficile
+ * Système de chargement sécurisé avec HLS
+ * Utilise HLS en priorité, avec fallback sur streaming obfusqué
+ * Architecture: HLS → API → token → playlist → segments
  */
-
-interface ChunkRequest {
-  videoId: string;
-  chunkIndex: number;
-  timestamp: number;
-  fingerprint: string;
-  previousHash?: string;
-}
-
-interface ChunkResponse {
-  data: ArrayBuffer;
-  nextHash: string;
-  nextToken: string;
-  expiresAt: number;
-}
 
 interface LoaderOptions {
   videoUrl: string;
   videoId: string;
   sessionToken: string;
-  videoElement?: HTMLVideoElement; // Optionnel : pour streaming MSE
+  videoElement?: HTMLVideoElement;
   onProgress?: (loaded: number, total: number) => void;
-  onChunkValidated?: (index: number) => void;
+  onError?: (error: Error) => void;
   signal?: AbortSignal;
 }
 
 export class SecureChunkLoader {
-  private chunkSize = 1024 * 1024; // 1MB par chunk pour un chargement plus rapide
   private currentToken: string;
-  private fingerprint: string | null = null;
-  private lastHash: string | null = null;
-  private sessionId: string | null = null;
-  private chunks: BlobPart[] = [];
   private isAborted = false;
-  private mseLoader: StreamingMSELoader | null = null;
+  private hlsPlayer: any = null;
+  private obfuscatedLoader: any = null;
 
   constructor(private options: LoaderOptions) {
     this.currentToken = options.sessionToken;
@@ -48,9 +26,54 @@ export class SecureChunkLoader {
 
   /**
    * Charge la vidéo en streaming optimisé et obfusqué
+   * Utilise HLS si disponible, sinon fallback sur le système obfusqué
    */
   async load(): Promise<string> {
-    // Utiliser le nouveau système de chargement obfusqué et optimisé
+    // Essayer d'utiliser HLS en premier (plus sécurisé)
+    try {
+      const { HLSPlayer } = await import('@/utils/hlsPlayer');
+      
+      // Obtenir la playlist HLS
+      const response = await fetch('/api/videos/hls/playlist', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.currentToken}`
+      },
+      body: JSON.stringify({
+          videoId: this.options.videoId
+      }),
+      signal: this.options.signal
+    });
+
+      if (response.ok) {
+        const data = await response.json();
+        const hlsPlayer = new HLSPlayer({
+          videoElement: this.options.videoElement!,
+          playlistUrl: data.playlistUrl,
+          sessionToken: this.currentToken,
+          onProgress: (progress) => {
+            if (this.options.onProgress) {
+              // Convertir le pourcentage en bytes approximatifs
+              this.options.onProgress(progress, 100);
+            }
+          },
+          onError: (error) => {
+            console.error('[SecureChunkLoader] ❌ Erreur HLS:', error);
+          }
+        });
+
+        await hlsPlayer.load();
+        this.hlsPlayer = hlsPlayer;
+        
+        console.log('[SecureChunkLoader] 🚀 Utilisation du système HLS sécurisé');
+        return data.playlistUrl;
+      }
+    } catch (error) {
+      console.warn('[SecureChunkLoader] ⚠️ HLS non disponible, utilisation du fallback');
+    }
+
+    // Fallback sur le système obfusqué
     const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
     
     console.log('[SecureChunkLoader] 🚀 Utilisation du système de streaming obfusqué optimisé');
@@ -72,92 +95,9 @@ export class SecureChunkLoader {
     });
 
     // Stocker le loader pour le cleanup
-    (this as any).obfuscatedLoader = obfuscatedLoader;
+    this.obfuscatedLoader = obfuscatedLoader;
 
     return await obfuscatedLoader.load();
-  }
-
-
-
-  /**
-   * Récupère les métadonnées de la vidéo
-   */
-  private async fetchMetadata(): Promise<{ size: number; contentType: string }> {
-    const response = await fetch(`/api/videos/secure-stream/metadata`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.currentToken}`
-      },
-      body: JSON.stringify({
-        videoId: this.options.videoId,
-        fingerprint: this.fingerprint
-      }),
-      signal: this.options.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`Erreur métadonnées: ${response.status}`);
-    }
-
-    return response.json();
-  }
-
-  /**
-   * Récupère un chunk avec validation
-   */
-  private async fetchChunk(index: number, totalChunks: number): Promise<ChunkResponse> {
-    const request: any = {
-      videoId: this.options.videoId,
-      chunkIndex: index,
-      timestamp: Date.now(),
-      fingerprint: this.fingerprint!,
-      encrypted: false // Mode non-chiffré pour SecureChunkLoader
-    };
-
-    // Inclure le sessionId si disponible
-    if (this.sessionId) {
-      request.sessionId = this.sessionId;
-    }
-
-    // Ne pas envoyer previousHash pour le premier chunk
-    if (index > 0 && this.lastHash) {
-      request.previousHash = this.lastHash;
-    }
-
-    const response = await fetch(`/api/videos/secure-stream/chunk`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.currentToken}`,
-        'X-Chunk-Index': index.toString(),
-        'X-Total-Chunks': totalChunks.toString()
-      },
-      body: JSON.stringify(request),
-      signal: this.options.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`Erreur chunk ${index}: ${response.status}`);
-    }
-
-    // Récupérer les headers de validation
-    const nextToken = response.headers.get('X-Next-Token');
-    const nextHash = response.headers.get('X-Next-Hash');
-    const expiresAt = parseInt(response.headers.get('X-Expires-At') || '0');
-
-    if (!nextToken || !nextHash) {
-      throw new Error('Réponse invalide du serveur');
-    }
-
-    const data = await response.arrayBuffer();
-
-    return {
-      data,
-      nextToken,
-      nextHash,
-      expiresAt
-    };
   }
 
   /**
@@ -165,14 +105,13 @@ export class SecureChunkLoader {
    */
   abort(): void {
     this.isAborted = true;
-    this.chunks = [];
     
-    if (this.mseLoader) {
-      this.mseLoader.abort();
+    if (this.hlsPlayer) {
+      this.hlsPlayer.cleanup();
     }
     
-    if ((this as any).obfuscatedLoader) {
-      (this as any).obfuscatedLoader.abort();
+    if (this.obfuscatedLoader) {
+      this.obfuscatedLoader.abort();
     }
   }
 
@@ -183,32 +122,17 @@ export class SecureChunkLoader {
   cleanup(): void {
     this.abort();
     
-    // SÉCURITÉ : Nettoyer tous les chunks en mémoire
-    // Empêche la reconstruction du MP4 complet
-    this.chunks = [];
-    
-    if (this.mseLoader) {
-      this.mseLoader.cleanup();
-      this.mseLoader = null;
+    if (this.hlsPlayer) {
+      this.hlsPlayer.cleanup();
+      this.hlsPlayer = null;
     }
     
-    if ((this as any).obfuscatedLoader) {
-      (this as any).obfuscatedLoader.cleanup();
-      (this as any).obfuscatedLoader = null;
+    if (this.obfuscatedLoader) {
+      this.obfuscatedLoader.cleanup();
+      this.obfuscatedLoader = null;
     }
     
-    console.log('[SecureChunkLoader] 🧹 Tous les chunks nettoyés - sécurité maximale');
-  }
-
-  /**
-   * Génère un hash de validation
-   */
-  private async generateHash(data: string): Promise<string> {
-    const encoder = new TextEncoder();
-    const dataBuffer = encoder.encode(data);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', dataBuffer);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    console.log('[SecureChunkLoader] 🧹 Ressources nettoyées - sécurité maximale');
   }
 }
 

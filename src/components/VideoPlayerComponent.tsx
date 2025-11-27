@@ -28,7 +28,6 @@ import { supabase } from "@/integrations/supabase/client"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { VideoSecurityManager } from "@/utils/videoSecurity"
 
 // Custom Slider Component avec corrections d'alignement
 const VideoSlider = ({ value, max = 100, step = 0.1, onValueChange, className = "", disabled = false }) => {
@@ -245,10 +244,11 @@ const VideoPlayerComponent = () => {
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [buffered, setBuffered] = useState(0)
   const [isBuffering, setIsBuffering] = useState(false)
-  const secManagerRef = useRef<VideoSecurityManager | null>(null)
+  const loaderRef = useRef<{ cleanup: () => void } | null>(null)
+  
   useEffect(() => {
     return () => {
-      secManagerRef.current?.cleanup?.();
+      loaderRef.current?.cleanup?.();
     };
   }, []);
 
@@ -593,9 +593,9 @@ const VideoPlayerComponent = () => {
       videoElement.load()
 
       // Nettoyer l'ancien loader si nécessaire
-      if (secManagerRef.current) {
-        secManagerRef.current.cleanup();
-        secManagerRef.current = null;
+      if (loaderRef.current) {
+        loaderRef.current.cleanup();
+        loaderRef.current = null;
       }
 
       // Add comprehensive error handling
@@ -655,12 +655,8 @@ const VideoPlayerComponent = () => {
         }
       }
 
-      // Charger la vidéo de manière sécurisée avec streaming progressif
-      console.log('[VideoPlayer] 🎬 Démarrage du streaming sécurisé pour videoId:', videoId);
-      
-      if (!secManagerRef.current) {
-        secManagerRef.current = new VideoSecurityManager();
-      }
+      // Charger la vidéo via le système HLS sécurisé
+      console.log('[VideoPlayer] 🎬 Démarrage du streaming HLS sécurisé pour videoId:', videoId);
 
       try {
         setIsBuffering(true);
@@ -670,29 +666,31 @@ const VideoPlayerComponent = () => {
         videoElement.addEventListener("loadeddata", handleVideoLoad, { once: true });
         videoElement.addEventListener("canplay", handleCanPlay, { once: true });
 
-        // Charger la vidéo via le système sécurisé avec streaming MSE
-        // On passe directement le loader avec l'élément vidéo pour le streaming progressif
+        // Charger la vidéo via le système HLS sécurisé
         const { SecureChunkLoader } = await import('@/utils/secureChunkLoader');
         const loader = new SecureChunkLoader({
           videoUrl,
           videoId,
           sessionToken: token,
-          videoElement, // Passer l'élément vidéo pour activer le streaming MSE
-          onProgress: (progress) => {
+          videoElement,
+          onProgress: (loaded, total) => {
+            const progress = total > 0 ? (loaded / total) * 100 : 0;
             setBuffered(progress);
             console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progress)}%`);
           }
         });
 
-        const blobUrl = await loader.load();
+        loaderRef.current = loader;
+        const sourceUrl = await loader.load();
         
-        // Si ce n'est pas déjà fait par MSE, définir la source
-        if (!videoElement.src || !videoElement.src.startsWith('blob:')) {
-          videoElement.src = blobUrl;
+        // Pour HLS, la source est déjà définie par HLS.js
+        // Pour le fallback obfusqué, on définit la source manuellement
+        if (!videoElement.src || (!videoElement.src.startsWith('blob:') && !videoElement.src.includes('.m3u8'))) {
+          videoElement.src = sourceUrl;
           await videoElement.load();
         }
         
-        console.log('[VideoPlayer] ✅ Streaming démarré avec succès');
+        console.log('[VideoPlayer] ✅ Streaming HLS démarré avec succès');
         setIsBuffering(false);
         
       } catch (error) {
