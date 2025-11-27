@@ -1051,6 +1051,18 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
         return res.status(404).json({ error: 'Vidéo non trouvée' });
       }
 
+      // Convertir la durée de "60min" ou "1h30min" en secondes
+      let durationInSeconds = 0;
+      if (video.duration) {
+        const durationStr = video.duration.toString().toLowerCase();
+        // Parser "60min", "1h30min", "1h", "30min", etc.
+        const hoursMatch = durationStr.match(/(\d+)h/);
+        const minutesMatch = durationStr.match(/(\d+)min/);
+        const hours = hoursMatch ? parseInt(hoursMatch[1]) : 0;
+        const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+        durationInSeconds = (hours * 3600) + (minutes * 60);
+      }
+
       // Obtenir la taille de la vidéo
       let totalSize = 0;
       try {
@@ -1066,7 +1078,7 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       const totalChunks = totalSize > 0 ? Math.ceil(totalSize / chunkSize) : 100;
 
       return res.json({
-        duration: video.duration || 0,
+        duration: durationInSeconds,
         totalSize,
         chunkSize,
         totalChunks
