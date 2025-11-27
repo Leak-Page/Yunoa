@@ -21,6 +21,8 @@ const supabase = createClient(
 // Stockage temporaire des sessions de streaming sécurisé
 const secureStreams = new Map();
 const chunkCache = new Map();
+// SÉCURITÉ : Suivi des requêtes par IP pour détecter les téléchargements
+const requestTracker = new Map(); // IP -> { count, lastRequest, videoId }
 
 // Nettoyage automatique
 setInterval(() => {
@@ -34,6 +36,12 @@ setInterval(() => {
   for (const [key, data] of chunkCache.entries()) {
     if (now - data.timestamp > 5 * 60 * 1000) {
       chunkCache.delete(key);
+    }
+  }
+  // Nettoyer le tracker de requêtes après 5 minutes d'inactivité
+  for (const [key, tracker] of requestTracker.entries()) {
+    if (now - tracker.lastRequest > 5 * 60 * 1000) {
+      requestTracker.delete(key);
     }
   }
 }, 60 * 1000);
@@ -126,13 +134,15 @@ export default async (req, res) => {
         return res.status(404).json({ error: 'Vidéo non trouvée' });
       }
 
-      // Générer un token signé pour l'URL (valide 1 heure)
+      // SÉCURITÉ : Générer un token signé pour l'URL (valide 5 minutes seulement)
+      // Le token doit être renouvelé régulièrement pour empêcher le téléchargement
       const token = jwt.sign(
         {
           userId: user.id,
           videoId: videoId,
           url: video.video_url,
-          exp: Math.floor(Date.now() / 1000) + 3600 // 1 heure
+          iat: Math.floor(Date.now() / 1000),
+          exp: Math.floor(Date.now() / 1000) + 300 // 5 minutes seulement
         },
         JWT_SECRET
       );
@@ -146,10 +156,11 @@ export default async (req, res) => {
       });
     }
 
-    // GET /api/videos/stream - Proxy pour le streaming avec token signé
+    // GET /api/videos/stream - Proxy pour le streaming avec token signé et validation stricte
     else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && req.method === 'GET') {
       const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
       const token = searchParams.get('token');
+      const rangeHeader = req.headers.range;
 
       if (!token) {
         return res.status(401).json({ error: 'Token manquant' });
@@ -158,27 +169,108 @@ export default async (req, res) => {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         const videoUrl = decoded.url;
+        const userId = decoded.userId;
+        const videoId = decoded.videoId;
 
-        // Récupérer le Range header pour le streaming
-        const range = req.headers.range;
+        // SÉCURITÉ : Vérifier que le token n'est pas trop vieux (max 5 minutes)
+        const tokenAge = Date.now() / 1000 - decoded.iat;
+        if (tokenAge > 300) { // 5 minutes
+          return res.status(401).json({ error: 'Token expiré' });
+        }
+
+        // SÉCURITÉ : Vérifier l'User-Agent pour détecter les extensions de téléchargement
+        const userAgent = req.headers['user-agent'] || '';
+        const suspiciousAgents = ['Video DownloadHelper', 'youtube-dl', 'wget', 'curl', 'aria2', 'ffmpeg', 'VLC'];
+        if (suspiciousAgents.some(agent => userAgent.toLowerCase().includes(agent.toLowerCase()))) {
+          logSuspiciousActivity('SUSPICIOUS_USER_AGENT', { 
+            userId, 
+            videoId, 
+            userAgent,
+            ip: getClientIp(req)
+          });
+          return res.status(403).json({ error: 'Accès refusé' });
+        }
+
+        // SÉCURITÉ : Vérifier le Referer pour s'assurer que la requête vient du site
+        const referer = req.headers.referer || req.headers.origin || '';
+        if (!referer.includes(req.headers.host)) {
+          logSuspiciousActivity('SUSPICIOUS_REFERER', { 
+            userId, 
+            videoId, 
+            referer,
+            ip: getClientIp(req)
+          });
+          // Ne pas bloquer complètement, mais logger
+        }
+
+        // SÉCURITÉ : Limiter le nombre de requêtes par IP pour détecter les téléchargements
+        const clientIp = getClientIp(req);
+        const now = Date.now();
+        const trackerKey = `${clientIp}_${videoId}`;
+        const tracker = requestTracker.get(trackerKey) || { count: 0, lastRequest: 0, videoId };
         
-        // Faire une requête proxy vers la vidéo
+        // Réinitialiser le compteur si plus de 1 minute depuis la dernière requête
+        if (now - tracker.lastRequest > 60000) {
+          tracker.count = 0;
+        }
+        
+        tracker.count++;
+        tracker.lastRequest = now;
+        requestTracker.set(trackerKey, tracker);
+        
+        // Bloquer si trop de requêtes (plus de 100 requêtes par minute = téléchargement)
+        if (tracker.count > 100) {
+          logSuspiciousActivity('EXCESSIVE_REQUESTS', { 
+            userId, 
+            videoId, 
+            count: tracker.count,
+            ip: clientIp
+          });
+          return res.status(429).json({ error: 'Trop de requêtes' });
+        }
+
+        // SÉCURITÉ : Limiter la taille des Range requests pour empêcher le téléchargement complet
+        let range = rangeHeader;
+        if (range) {
+          const rangeMatch = range.match(/bytes=(\d+)-(\d*)/);
+          if (rangeMatch) {
+            const start = parseInt(rangeMatch[1]);
+            const end = rangeMatch[2] ? parseInt(rangeMatch[2]) : null;
+            
+            // Limiter à 10MB par requête maximum
+            const maxChunkSize = 10 * 1024 * 1024;
+            if (end && (end - start) > maxChunkSize) {
+              range = `bytes=${start}-${start + maxChunkSize - 1}`;
+            } else if (!end) {
+              // Si pas de fin spécifiée, limiter à 10MB
+              range = `bytes=${start}-${start + maxChunkSize - 1}`;
+            }
+          }
+        } else {
+          // SÉCURITÉ : Si pas de Range header, limiter à 2MB (pour les métadonnées seulement)
+          range = 'bytes=0-2097151'; // 2MB
+        }
+        
+        // Faire une requête proxy vers la vidéo avec Range limité
         const videoResponse = await fetch(videoUrl, {
-          headers: range ? { 'Range': range } : {}
+          headers: { 'Range': range }
         });
 
         if (!videoResponse.ok && videoResponse.status !== 206) {
           return res.status(videoResponse.status).json({ error: 'Erreur de récupération vidéo' });
         }
 
-        // Copier les headers de la réponse
+        // SÉCURITÉ : Headers pour empêcher la mise en cache et le téléchargement
         const headers = {
           'Content-Type': videoResponse.headers.get('content-type') || 'video/mp4',
           'Content-Length': videoResponse.headers.get('content-length') || '',
           'Accept-Ranges': 'bytes',
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Cache-Control': 'no-cache, no-store, must-revalidate, private',
           'Pragma': 'no-cache',
-          'Expires': '0'
+          'Expires': '0',
+          'X-Content-Type-Options': 'nosniff',
+          'X-Frame-Options': 'DENY',
+          'Content-Disposition': 'inline; filename="stream.mp4"' // inline empêche le téléchargement
         };
 
         if (videoResponse.status === 206) {
