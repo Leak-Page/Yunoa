@@ -26,6 +26,13 @@ const chunkCache = new Map();
 const streamingSessions = new Map();
 
 /**
+ * Génère un hash SHA-256
+ */
+function generateHash(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
  * Génère un token de session de streaming temporaire (valide 60 secondes)
  */
 function generateStreamingSessionToken(userId, videoId) {
@@ -128,13 +135,6 @@ setInterval(() => {
     }
   }
 }, 60 * 1000);
-
-/**
- * Génère un hash SHA-256
- */
-function generateHash(data) {
-  return crypto.createHash('sha256').update(data).digest('hex');
-}
 
 /**
  * Génère un token unique avec timestamp
@@ -575,45 +575,85 @@ export default async (req, res) => {
     // POST /api/videos/stream/session - Créer une session de streaming sécurisée
     else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && pathParts[3] === 'session' && req.method === 'POST') {
       try {
-        const user = authenticateToken(req);
-        const { videoId } = req.body;
+        // Parser le body si nécessaire (pour Vercel/Serverless)
+        let body = req.body;
+        if (typeof body === 'string') {
+          try {
+            body = JSON.parse(body);
+          } catch (e) {
+            return res.status(400).json({ error: 'Body JSON invalide' });
+          }
+        }
+        
+        let user;
+        try {
+          user = authenticateToken(req);
+        } catch (authError) {
+          console.error('Erreur authentification session:', authError.message);
+          return res.status(401).json({ 
+            error: 'Authentification requise',
+            details: authError.message 
+          });
+        }
+        
+        if (!user || !user.id) {
+          console.error('Utilisateur non authentifié:', user);
+          return res.status(401).json({ error: 'Utilisateur non authentifié' });
+        }
+        
+        const videoId = body?.videoId;
         
         if (!videoId) {
+          console.error('VideoId manquant dans body:', body);
           return res.status(400).json({ error: 'ID de vidéo requis' });
         }
         
         // Vérifier les streams simultanés
-        const streamCheck = checkConcurrentStreams(user.id, videoId);
-        if (!streamCheck.allowed) {
-          return res.status(429).json({
-            error: streamCheck.message,
-            code: 'TOO_MANY_STREAMS'
-          });
+        try {
+          const streamCheck = checkConcurrentStreams(user.id, videoId);
+          if (!streamCheck.allowed) {
+            return res.status(429).json({
+              error: streamCheck.message,
+              code: 'TOO_MANY_STREAMS'
+            });
+          }
+        } catch (streamError) {
+          console.error('Erreur vérification streams:', streamError);
+          // Continuer même en cas d'erreur de vérification
         }
         
         // Créer une session de streaming sécurisée
-        const { token, sessionId, expiresAt } = generateStreamingSessionToken(user.id, videoId);
-        
-        streamingSessions.set(sessionId, {
-          userId: user.id,
-          videoId,
-          createdAt: Date.now(),
-          expiresAt,
-          lastRequestTime: Date.now(),
-          requestCount: 0,
-          suspiciousActivity: 0
-        });
-        
-        res.json({
-          sessionToken: token,
-          expiresIn: 60, // 60 secondes
-          refreshInterval: 30 // Renouveler toutes les 30 secondes
-        });
-      } catch (error) {
-        if (error.message === 'Token manquant' || error.message === 'Token invalide') {
-          return res.status(401).json({ error: 'Authentification requise' });
+        try {
+          const { token, sessionId, expiresAt } = generateStreamingSessionToken(user.id, videoId);
+          
+          streamingSessions.set(sessionId, {
+            userId: user.id,
+            videoId,
+            createdAt: Date.now(),
+            expiresAt,
+            lastRequestTime: Date.now(),
+            requestCount: 0,
+            suspiciousActivity: 0
+          });
+          
+          res.json({
+            sessionToken: token,
+            expiresIn: 60, // 60 secondes
+            refreshInterval: 30 // Renouveler toutes les 30 secondes
+          });
+        } catch (tokenError) {
+          console.error('Erreur génération token session:', tokenError);
+          return res.status(500).json({ 
+            error: 'Erreur création session',
+            details: tokenError.message 
+          });
         }
-        return res.status(500).json({ error: 'Erreur serveur' });
+      } catch (error) {
+        console.error('Erreur endpoint session streaming:', error);
+        return res.status(500).json({ 
+          error: 'Erreur serveur',
+          details: error.message 
+        });
       }
     }
     
