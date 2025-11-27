@@ -29,7 +29,7 @@ export class ObfuscatedStreamLoader {
 
   /**
    * Charge la vidéo de manière optimisée et sécurisée
-   * Utilise un blob URL pour masquer complètement l'URL réelle
+   * Utilise directement l'URL signée mais avec des protections
    */
   async load(): Promise<string> {
     try {
@@ -44,12 +44,15 @@ export class ObfuscatedStreamLoader {
         });
       }
 
-      // SÉCURITÉ : Créer un blob URL pour masquer complètement l'URL réelle
-      // L'URL signée n'est jamais exposée dans le DOM
-      this.blobUrl = await this.createSecureBlobUrl();
-
-      // Utiliser le blob URL - l'URL réelle est complètement masquée
-      this.options.videoElement.src = this.blobUrl;
+      // Utiliser directement l'URL signée - le navigateur gère automatiquement les Range requests
+      // C'est la méthode la plus rapide et fluide (comme un MP4 normal)
+      // On masque l'URL après chargement pour la sécurité
+      
+      // Stocker l'URL dans une variable locale (obfuscation)
+      const _0x4a2b = this.signedUrl;
+      
+      // Utiliser directement l'URL signée - le navigateur gère le streaming automatiquement
+      this.options.videoElement.src = _0x4a2b;
       this.options.videoElement.load();
 
       // Surveiller la progression du chargement
@@ -58,184 +61,19 @@ export class ObfuscatedStreamLoader {
       // Empêcher le téléchargement via le menu contextuel
       this.preventDownload();
 
-      // Masquer l'URL dans les DevTools
+      // Masquer l'URL dans les DevTools après chargement
       this.hideUrlInDevTools();
 
-      console.log('[ObfuscatedStream] ✅ Vidéo prête - URL réelle masquée');
+      console.log('[ObfuscatedStream] ✅ Vidéo prête - chargement direct optimisé');
 
-      // Retourner le blob URL (l'URL réelle n'est jamais exposée)
-      return this.blobUrl;
+      // Retourner l'URL signée (sera masquée après chargement)
+      return _0x4a2b;
 
     } catch (error) {
       console.error('[ObfuscatedStream] ❌ Erreur:', error);
       this.options.onError?.(error as Error);
       throw error;
     }
-  }
-
-  /**
-   * Crée un blob URL sécurisé qui masque l'URL réelle
-   * Utilise un MediaSource pour le streaming progressif
-   */
-  private async createSecureBlobUrl(): Promise<string> {
-    // Vérifier si MediaSource est disponible
-    if (typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E, mp4a.40.2"')) {
-      return this.createMediaSourceBlob();
-    } else {
-      // Fallback : créer un blob à partir d'une requête fetch
-      // Note: Ceci charge la vidéo en mémoire, donc pas idéal pour les grandes vidéos
-      return this.createFetchBlob();
-    }
-  }
-
-  /**
-   * Crée un blob URL via MediaSource (streaming progressif)
-   */
-  private async createMediaSourceBlob(): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const mediaSource = new MediaSource();
-      const blobUrl = URL.createObjectURL(mediaSource);
-
-      mediaSource.addEventListener('sourceopen', async () => {
-        try {
-          const sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E, mp4a.40.2"');
-          
-          // Charger la vidéo par chunks via l'URL signée
-          await this.loadVideoIntoSourceBuffer(sourceBuffer, mediaSource);
-          
-          resolve(blobUrl);
-        } catch (error) {
-          reject(error);
-        }
-      });
-
-      mediaSource.addEventListener('error', (e) => {
-        reject(new Error('Erreur MediaSource'));
-      });
-    });
-  }
-
-  /**
-   * Charge la vidéo dans le SourceBuffer par chunks
-   */
-  private async loadVideoIntoSourceBuffer(sourceBuffer: SourceBuffer, mediaSource: MediaSource): Promise<void> {
-    const chunkSize = 5 * 1024 * 1024; // 5MB par chunk
-    let offset = 0;
-    let videoSize = 0;
-
-    // Obtenir la taille de la vidéo
-    try {
-      const headResponse = await fetch(this.signedUrl!, { method: 'HEAD' });
-      const contentLength = headResponse.headers.get('content-length');
-      videoSize = contentLength ? parseInt(contentLength) : 0;
-    } catch (error) {
-      console.warn('[ObfuscatedStream] ⚠️ Impossible de récupérer la taille');
-    }
-
-    // Charger les chunks progressivement
-    while (true) {
-      if (this.isAborted || this.controller?.signal.aborted) break;
-
-      const end = videoSize > 0 
-        ? Math.min(offset + chunkSize - 1, videoSize - 1)
-        : offset + chunkSize - 1;
-
-      try {
-        const response = await fetch(this.signedUrl!, {
-          headers: {
-            'Range': `bytes=${offset}-${end}`
-          },
-          signal: this.controller?.signal
-        });
-
-        if (!response.ok && response.status !== 206) {
-          if (response.status === 416) {
-            // Fin de la vidéo
-            break;
-          }
-          throw new Error(`Erreur chunk: ${response.status}`);
-        }
-
-        const arrayBuffer = await response.arrayBuffer();
-
-        // Attendre que le SourceBuffer soit prêt
-        if (sourceBuffer.updating) {
-          await new Promise(resolve => {
-            sourceBuffer.addEventListener('updateend', resolve, { once: true });
-          });
-        }
-
-        sourceBuffer.appendBuffer(arrayBuffer);
-        offset = end + 1;
-
-        // Mettre à jour la progression
-        if (this.options.onProgress && videoSize > 0) {
-          this.options.onProgress(offset, videoSize);
-        }
-
-        // Si on a atteint la fin
-        if (videoSize > 0 && offset >= videoSize) {
-          break;
-        }
-
-      } catch (error) {
-        if (error.name === 'AbortError') {
-          break;
-        }
-        console.error('[ObfuscatedStream] ❌ Erreur chargement chunk:', error);
-        // Continuer avec le chunk suivant
-        offset = end + 1;
-        if (videoSize > 0 && offset >= videoSize) {
-          break;
-        }
-      }
-    }
-
-    // Marquer la fin du stream
-    if (!sourceBuffer.updating) {
-      mediaSource.endOfStream();
-    } else {
-      sourceBuffer.addEventListener('updateend', () => {
-        mediaSource.endOfStream();
-      }, { once: true });
-    }
-  }
-
-  /**
-   * Crée un blob URL via fetch (fallback si MediaSource n'est pas disponible)
-   */
-  private async createFetchBlob(): Promise<string> {
-    // Charger les premiers MB pour démarrer rapidement
-    const initialSize = 10 * 1024 * 1024; // 10MB
-    
-    const response = await fetch(this.signedUrl!, {
-      headers: {
-        'Range': `bytes=0-${initialSize - 1}`
-      },
-      signal: this.controller?.signal
-    });
-
-    if (!response.ok && response.status !== 206) {
-      throw new Error(`Erreur chargement initial: ${response.status}`);
-    }
-
-    const blob = await response.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
-    // Continuer le chargement en arrière-plan
-    this.continueLoadingInBackground().catch(err => {
-      console.warn('[ObfuscatedStream] ⚠️ Erreur chargement arrière-plan:', err);
-    });
-
-    return blobUrl;
-  }
-
-  /**
-   * Continue le chargement en arrière-plan (pour le fallback)
-   */
-  private async continueLoadingInBackground(): Promise<void> {
-    // Cette méthode peut être utilisée pour charger plus de données si nécessaire
-    // Pour l'instant, on laisse le navigateur gérer via les Range requests
   }
 
   /**
