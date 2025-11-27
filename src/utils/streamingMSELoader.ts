@@ -171,53 +171,102 @@ export class StreamingMSELoader {
     };
 
     // Charger les segments séquentiellement
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 3;
+    const MAX_RETRIES_PER_SEGMENT = 2;
+    
     for (let i = 0; i < this.totalChunks; i++) {
       if (this.isAborted || this.options.signal?.aborted) {
         break;
       }
 
-      try {
-        const segment = await this.fetchSegment(i);
-        
-        // Ajouter le segment au blob
-        blobParts.push(segment.data);
-        
-        // Mettre à jour le token et le hash
-        this.currentToken = segment.nextToken;
-        this.lastHash = segment.nextHash;
+      let segmentLoaded = false;
+      let retryCount = 0;
 
-        // Mettre à jour la progression
-        if (this.options.onProgress) {
-          const loaded = blobParts.length * this.chunkSize;
-          this.options.onProgress(Math.min(loaded, this.totalSize), this.totalSize);
-        }
-
-        // Mettre à jour le blob progressivement (seulement si nécessaire)
-        // Ne pas mettre à jour à chaque segment pour éviter les interruptions
-        if (!isVideoReady || blobParts.length % UPDATE_INTERVAL === 0) {
-          updateBlob(false);
-        }
-
-        // Si la vidéo est prête, vérifier le buffer et charger plus si nécessaire
-        if (isVideoReady) {
-          const videoElement = this.options.videoElement;
-          const bufferedEnd = videoElement.buffered.length > 0 
-            ? videoElement.buffered.end(videoElement.buffered.length - 1) 
-            : 0;
-          const currentTime = videoElement.currentTime || 0;
-          const bufferAhead = bufferedEnd - currentTime;
+      // Essayer de charger le segment avec retry limité
+      while (!segmentLoaded && retryCount <= MAX_RETRIES_PER_SEGMENT) {
+        try {
+          const segment = await this.fetchSegment(i);
           
-          // Si le buffer est très faible, forcer une mise à jour
-          if (bufferAhead < 3) {
-            updateBlob(true);
-          }
-        }
+          // Ajouter le segment au blob
+          blobParts.push(segment.data);
+          
+          // Mettre à jour le token et le hash
+          this.currentToken = segment.nextToken;
+          this.lastHash = segment.nextHash;
 
-      } catch (error) {
-        console.error(`[StreamingMSE] ❌ Erreur segment ${i}:`, error);
-        // Réessayer après un délai
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        i--; // Réessayer le même segment
+          // Mettre à jour la progression
+          if (this.options.onProgress) {
+            const loaded = blobParts.length * this.chunkSize;
+            this.options.onProgress(Math.min(loaded, this.totalSize), this.totalSize);
+          }
+
+          // Réinitialiser le compteur d'erreurs consécutives en cas de succès
+          consecutiveErrors = 0;
+          segmentLoaded = true;
+
+          // Mettre à jour le blob progressivement (seulement si nécessaire)
+          // Ne pas mettre à jour à chaque segment pour éviter les interruptions
+          if (!isVideoReady || blobParts.length % UPDATE_INTERVAL === 0) {
+            updateBlob(false);
+          }
+
+          // Si la vidéo est prête, vérifier le buffer et charger plus si nécessaire
+          if (isVideoReady) {
+            const videoElement = this.options.videoElement;
+            const bufferedEnd = videoElement.buffered.length > 0 
+              ? videoElement.buffered.end(videoElement.buffered.length - 1) 
+              : 0;
+            const currentTime = videoElement.currentTime || 0;
+            const bufferAhead = bufferedEnd - currentTime;
+            
+            // Si le buffer est très faible, forcer une mise à jour
+            if (bufferAhead < 3) {
+              updateBlob(true);
+            }
+          }
+
+        } catch (error) {
+          retryCount++;
+          consecutiveErrors++;
+          
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const isSessionError = errorMessage.includes('Session invalide') || 
+                                 errorMessage.includes('SESSION_TIMEOUT') ||
+                                 errorMessage.includes('INVALID_SEQUENCE');
+          
+          if (isSessionError) {
+            // Erreur de session - arrêter le chargement
+            console.error(`[StreamingMSE] ❌ Erreur de session sur le segment ${i}:`, errorMessage);
+            this.options.onError?.(new Error('Session expirée - veuillez recharger la vidéo'));
+            return blobUrl || '';
+          }
+          
+          if (retryCount > MAX_RETRIES_PER_SEGMENT) {
+            // Trop de tentatives pour ce segment
+            console.error(`[StreamingMSE] ❌ Échec après ${MAX_RETRIES_PER_SEGMENT} tentatives pour le segment ${i}`);
+            
+            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+              // Trop d'erreurs consécutives - arrêter
+              console.error(`[StreamingMSE] ❌ Trop d'erreurs consécutives (${consecutiveErrors}), arrêt du chargement`);
+              this.options.onError?.(new Error('Trop d\'erreurs de chargement - veuillez réessayer'));
+              return blobUrl || '';
+            }
+            
+            // Passer au segment suivant
+            console.warn(`[StreamingMSE] ⚠️ Passage au segment suivant (${i + 1})`);
+            break;
+          }
+          
+          // Attendre avant de réessayer
+          console.warn(`[StreamingMSE] ⚠️ Nouvelle tentative ${retryCount}/${MAX_RETRIES_PER_SEGMENT} pour le segment ${i}`);
+          await new Promise(resolve => setTimeout(resolve, 1000 * retryCount)); // Délai exponentiel
+        }
+      }
+      
+      // Si le segment n'a pas pu être chargé après toutes les tentatives, continuer avec le suivant
+      if (!segmentLoaded && retryCount > MAX_RETRIES_PER_SEGMENT) {
+        // On continue avec le segment suivant au lieu de boucler infiniment
         continue;
       }
     }

@@ -382,8 +382,9 @@ export default async (req, res) => {
         session.lastChunkTime = now;
       }
       
-      // Timeout plus long pour le premier chunk (5 min), ensuite 90 secondes entre chunks
-      const timeoutLimit = chunkIndex === 0 ? 5 * 60 * 1000 : 90 * 1000;
+      // Timeout plus long pour permettre un chargement séquentiel
+      // Premier chunk : 5 minutes, ensuite 5 minutes entre chunks (pour permettre un chargement progressif)
+      const timeoutLimit = chunkIndex === 0 ? 5 * 60 * 1000 : 5 * 60 * 1000;
       if (now - session.lastChunkTime > timeoutLimit) {
         console.log(`⚠️ Session timeout: ${now - session.lastChunkTime}ms > ${timeoutLimit}ms pour chunk ${chunkIndex}`);
         return res.status(403).json({ 
