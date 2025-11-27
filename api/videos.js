@@ -229,26 +229,48 @@ export default async (req, res) => {
           return res.status(429).json({ error: 'Trop de requêtes' });
         }
 
-        // SÉCURITÉ : Limiter la taille des Range requests pour empêcher le téléchargement complet
+        // SÉCURITÉ : Vérifier et valider le Range header
         let range = rangeHeader;
+        
+        // Obtenir la taille réelle de la vidéo d'abord
+        const headResponse = await fetch(videoUrl, { method: 'HEAD' });
+        const contentLength = headResponse.headers.get('content-length');
+        const videoSize = contentLength ? parseInt(contentLength) : 0;
+        
         if (range) {
           const rangeMatch = range.match(/bytes=(\d+)-(\d*)/);
           if (rangeMatch) {
             const start = parseInt(rangeMatch[1]);
             const end = rangeMatch[2] ? parseInt(rangeMatch[2]) : null;
             
-            // Limiter à 10MB par requête maximum
-            const maxChunkSize = 10 * 1024 * 1024;
-            if (end && (end - start) > maxChunkSize) {
-              range = `bytes=${start}-${start + maxChunkSize - 1}`;
-            } else if (!end) {
-              // Si pas de fin spécifiée, limiter à 10MB
+            // Vérifier que le range est valide
+            if (start < 0 || (end !== null && end < start)) {
+              return res.status(416).json({ error: 'Range Not Satisfiable' });
+            }
+            
+            // Si on a la taille, vérifier qu'on ne dépasse pas
+            if (videoSize > 0 && (start >= videoSize || (end !== null && end >= videoSize))) {
+              return res.status(416).json({ error: 'Range Not Satisfiable' });
+            }
+            
+            // Limiter à 20MB par requête maximum pour le streaming
+            const maxChunkSize = 20 * 1024 * 1024;
+            if (end === null) {
+              // Pas de fin spécifiée, limiter à maxChunkSize
+              const actualEnd = videoSize > 0 
+                ? Math.min(start + maxChunkSize - 1, videoSize - 1)
+                : start + maxChunkSize - 1;
+              range = `bytes=${start}-${actualEnd}`;
+            } else if ((end - start) > maxChunkSize) {
+              // Range trop grand, limiter
               range = `bytes=${start}-${start + maxChunkSize - 1}`;
             }
           }
         } else {
           // SÉCURITÉ : Si pas de Range header, limiter à 2MB (pour les métadonnées seulement)
-          range = 'bytes=0-2097151'; // 2MB
+          range = videoSize > 0 
+            ? `bytes=0-${Math.min(2097151, videoSize - 1)}`
+            : 'bytes=0-2097151'; // 2MB
         }
         
         // Faire une requête proxy vers la vidéo avec Range limité
@@ -270,7 +292,9 @@ export default async (req, res) => {
           'Expires': '0',
           'X-Content-Type-Options': 'nosniff',
           'X-Frame-Options': 'DENY',
-          'Content-Disposition': 'inline; filename="stream.mp4"' // inline empêche le téléchargement
+          'Content-Disposition': 'inline; filename="stream.mp4"', // inline empêche le téléchargement
+          'X-Robots-Tag': 'noindex, nofollow', // Empêcher l'indexation
+          'Cross-Origin-Resource-Policy': 'same-origin' // Empêcher l'accès cross-origin
         };
 
         if (videoResponse.status === 206) {
