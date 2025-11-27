@@ -492,7 +492,38 @@ export default async (req, res) => {
       }
 
       try {
-        const user = authenticateToken(req);
+        // Créer une requête modifiée avec le token dans les headers pour authenticateToken
+        const modifiedReq = {
+          ...req,
+          headers: {
+            ...req.headers,
+            authorization: `Bearer ${token}`
+          }
+        };
+        
+        let user;
+        try {
+          user = authenticateToken(modifiedReq);
+        } catch (authError) {
+          console.error('Erreur authentification token:', authError.message);
+          // Essayer de décoder le token pour debug
+          try {
+            const decoded = jwt.decode(token, { complete: true });
+            console.log('Token décodé:', decoded ? 'OK' : 'FAILED', decoded?.payload ? 'Payload présent' : 'Pas de payload');
+            if (decoded?.payload) {
+              console.log('Payload iss:', decoded.payload.iss);
+              console.log('Payload sub:', decoded.payload.sub);
+              console.log('Payload email:', decoded.payload.email);
+            }
+          } catch (e) {
+            console.error('Impossible de décoder le token:', e.message);
+          }
+          return res.status(401).json({ 
+            error: 'Token d\'authentification invalide',
+            details: authError.message 
+          });
+        }
+        
         const clientIp = getClientIp(req);
         
         // Vérifier les abus
