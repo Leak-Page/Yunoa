@@ -29,68 +29,13 @@ export class SecureChunkLoader {
    * Utilise HLS si disponible, sinon fallback sur le système obfusqué
    */
   async load(): Promise<string> {
-    // Essayer d'utiliser HLS en premier (plus sécurisé)
-    try {
-      const { HLSPlayer } = await import('@/utils/hlsPlayer');
-      
-      // Vérifier si HLS est supporté
-      if (!HLSPlayer.isSupported()) {
-        throw new Error('HLS non supporté');
-      }
-      
-      // Obtenir la playlist HLS
-      const response = await fetch('/api/videos/hls/playlist', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.currentToken}`
-        },
-        body: JSON.stringify({
-          videoId: this.options.videoId
-        }),
-        signal: this.options.signal
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Erreur inconnue' }));
-        throw new Error(`Erreur API HLS: ${response.status} - ${errorData.error || 'Erreur inconnue'}`);
-      }
-
-      const data = await response.json();
-      
-      if (!data.playlistUrl) {
-        throw new Error('Playlist URL manquante dans la réponse');
-      }
-      
-      const hlsPlayer = new HLSPlayer({
-        videoElement: this.options.videoElement!,
-        playlistUrl: data.playlistUrl,
-        sessionToken: this.currentToken,
-        onProgress: (progress) => {
-          if (this.options.onProgress) {
-            // Convertir le pourcentage en bytes approximatifs
-            this.options.onProgress(progress, 100);
-          }
-        },
-        onError: (error) => {
-          console.error('[SecureChunkLoader] ❌ Erreur HLS:', error);
-          this.options.onError?.(error);
-        }
-      });
-
-      await hlsPlayer.load();
-      this.hlsPlayer = hlsPlayer;
-      
-      console.log('[SecureChunkLoader] 🚀 Utilisation du système HLS sécurisé');
-      return data.playlistUrl;
-    } catch (error) {
-      console.warn('[SecureChunkLoader] ⚠️ HLS non disponible, utilisation du fallback:', error);
-    }
-
-    // Fallback sur le système obfusqué
-    const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
+    // NOTE: HLS désactivé car nécessite une conversion préalable des vidéos en format HLS (.ts)
+    // Les vidéos MP4 brutes ne peuvent pas être servies comme segments HLS
+    // Utiliser directement le système obfusqué qui fonctionne avec MP4
+    console.log('[SecureChunkLoader] 🚀 Utilisation du système de streaming obfusqué (HLS nécessite conversion préalable)');
     
-    console.log('[SecureChunkLoader] 🚀 Utilisation du système de streaming obfusqué optimisé');
+    // Utiliser directement le système obfusqué
+    const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
     
     const obfuscatedLoader = new ObfuscatedStreamLoader({
       videoUrl: this.options.videoUrl,
@@ -104,6 +49,7 @@ export class SecureChunkLoader {
       },
       onError: (error) => {
         console.error('[SecureChunkLoader] ❌ Erreur:', error);
+        this.options.onError?.(error);
       },
       signal: this.options.signal
     });
