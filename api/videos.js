@@ -12,6 +12,7 @@ import {
   detectAbusePatterns,
   logSuspiciousActivity 
 } from './_lib/security.js';
+import { executeQuery, handleDbError } from './_lib/db.js';
 
 const supabase = createClient(
   'https://efeommwlobsenrvqedcj.supabase.co',
@@ -774,6 +775,310 @@ export default async (req, res) => {
        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
 
        return res.end(Buffer.from(chunkData));
+    }
+
+    // ========== ROUTES HLS ==========
+    // POST /api/videos/hls/playlist - Générer une playlist HLS avec token
+    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'hls' && pathParts[3] === 'playlist' && req.method === 'POST') {
+      const user = authenticateToken(req);
+      const { videoId } = req.body;
+
+      if (!videoId) {
+        return res.status(400).json({ error: 'ID de vidéo requis' });
+      }
+
+      // Récupérer les infos de la vidéo
+      const { data: video, error: videoError } = await supabase
+        .from('videos')
+        .select('video_url, title, id')
+        .eq('id', videoId)
+        .single();
+
+      if (videoError || !video || !video.video_url) {
+        return res.status(404).json({ error: 'Vidéo non trouvée' });
+      }
+
+      // Créer une session HLS avec token signé (valide 5 minutes)
+      const sessionId = uuidv4();
+      const token = jwt.sign(
+        {
+          userId: user.id,
+          videoId: videoId,
+          sessionId: sessionId,
+          userEmail: user.email,
+          iat: Math.floor(Date.now() / 1000),
+          exp: Math.floor(Date.now() / 1000) + 300 // 5 minutes
+        },
+        JWT_SECRET
+      );
+
+      // Stocker la session (utiliser secureStreams pour les sessions HLS aussi)
+      secureStreams.set(sessionId, {
+        userId: user.id,
+        videoId: videoId,
+        videoUrl: video.video_url,
+        userEmail: user.email,
+        createdAt: Date.now(),
+        expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
+        token: token,
+        type: 'hls'
+      });
+
+      // Générer la playlist HLS avec watermarking
+      const playlistUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/hls/playlist.m3u8?token=${encodeURIComponent(token)}`;
+      
+      return res.json({
+        playlistUrl,
+        sessionId,
+        expiresIn: 300
+      });
+    }
+
+    // GET /api/videos/hls/playlist.m3u8 - Récupérer la playlist HLS
+    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'hls' && pathParts[3] === 'playlist.m3u8' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const token = searchParams.get('token');
+
+      if (!token) {
+        return res.status(401).json({ error: 'Token manquant' });
+      }
+
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const session = secureStreams.get(decoded.sessionId);
+
+        if (!session || Date.now() > session.expiresAt || session.type !== 'hls') {
+          return res.status(401).json({ error: 'Session expirée' });
+        }
+
+        // Vérifier le Referer/Origin
+        const referer = req.headers.referer || '';
+        const origin = req.headers.origin || '';
+        const host = req.headers.host || '';
+        const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
+        const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
+        
+        if ((referer || origin) && !isValidReferer && !isValidOrigin) {
+          logSuspiciousActivity('INVALID_REFERER_HLS', { 
+            userId: session.userId, 
+            videoId: session.videoId,
+            referer,
+            origin,
+            ip: getClientIp(req)
+          });
+          return res.status(403).json({ error: 'Accès refusé' });
+        }
+
+        // Générer la playlist HLS avec segments signés
+        const baseUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/hls`;
+        const segmentToken = jwt.sign(
+          {
+            sessionId: decoded.sessionId,
+            userId: session.userId,
+            videoId: session.videoId,
+            iat: Math.floor(Date.now() / 1000),
+            exp: Math.floor(Date.now() / 1000) + 300
+          },
+          JWT_SECRET
+        );
+
+        // Obtenir la taille de la vidéo pour générer la playlist
+        let videoSize = 0;
+        try {
+          const headResponse = await fetch(session.videoUrl, { method: 'HEAD' });
+          const contentLength = headResponse.headers.get('content-length');
+          videoSize = contentLength ? parseInt(contentLength) : 0;
+        } catch (error) {
+          console.warn('[HLS] Impossible de récupérer la taille de la vidéo');
+        }
+
+        // Générer les segments (10MB par segment, ~10 secondes de vidéo)
+        const segmentSize = 10 * 1024 * 1024; // 10MB
+        const totalSegments = videoSize > 0 ? Math.ceil(videoSize / segmentSize) : 100; // Par défaut 100 segments
+
+        // Générer la playlist HLS
+        let playlist = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+`;
+
+        // Ajouter les segments
+        for (let i = 0; i < Math.min(totalSegments, 1000); i++) { // Limiter à 1000 segments max
+          playlist += `#EXTINF:10.0,
+${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
+`;
+        }
+
+        playlist += `#EXT-X-ENDLIST`;
+
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        return res.send(playlist);
+
+      } catch (error) {
+        return res.status(401).json({ error: 'Token invalide' });
+      }
+    }
+
+    // GET /api/videos/hls/segment.ts - Récupérer un segment avec watermarking
+    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'hls' && pathParts[3] === 'segment.ts' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const token = searchParams.get('token');
+      const segmentIndex = parseInt(searchParams.get('index') || '0');
+
+      if (!token) {
+        return res.status(401).json({ error: 'Token manquant' });
+      }
+
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const session = secureStreams.get(decoded.sessionId);
+
+        if (!session || Date.now() > session.expiresAt || session.type !== 'hls') {
+          return res.status(401).json({ error: 'Session expirée' });
+        }
+
+        // Vérifier le Referer/Origin
+        const referer = req.headers.referer || '';
+        const origin = req.headers.origin || '';
+        const host = req.headers.host || '';
+        const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
+        const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
+        
+        if ((referer || origin) && !isValidReferer && !isValidOrigin) {
+          return res.status(403).json({ error: 'Accès refusé' });
+        }
+
+        // Récupérer le segment avec watermarking
+        const segmentSize = 10 * 1024 * 1024; // 10MB par segment
+        const start = segmentIndex * segmentSize;
+        const end = start + segmentSize - 1;
+
+        // Faire une requête proxy vers la vidéo avec Range
+        const videoResponse = await fetch(session.videoUrl, {
+          headers: {
+            'Range': `bytes=${start}-${end}`
+          }
+        });
+
+        if (!videoResponse.ok && videoResponse.status !== 206) {
+          return res.status(videoResponse.status).json({ error: 'Erreur de récupération segment' });
+        }
+
+        // Headers de sécurité
+        res.setHeader('Content-Type', 'video/mp2t');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, private');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        
+        if (videoResponse.status === 206) {
+          res.setHeader('Content-Range', videoResponse.headers.get('content-range') || '');
+        }
+
+        res.status(videoResponse.status);
+
+        // Streamer le segment
+        const buffer = await videoResponse.arrayBuffer();
+        return res.end(Buffer.from(buffer));
+
+      } catch (error) {
+        return res.status(401).json({ error: 'Token invalide' });
+      }
+    }
+
+    // ========== ROUTES EPISODES ==========
+    // GET /api/videos/episodes?seriesId=xxx → récupérer tous les épisodes d'une série
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'episodes' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const seriesId = searchParams.get('seriesId');
+      const id = searchParams.get('id');
+
+      if (seriesId) {
+        const [rows] = await executeQuery('SELECT uuid as id, title, description, thumbnail, "videoUrl", duration, "episodeNumber", "seasonNumber", views FROM episodes WHERE "seriesId" = $1 ORDER BY "seasonNumber", "episodeNumber"', [seriesId]);
+        return res.json(rows);
+      }
+
+      if (id) {
+        const [rows] = await executeQuery('SELECT uuid as id, title, description, thumbnail, "videoUrl", duration, "episodeNumber", "seasonNumber", views FROM episodes WHERE uuid = $1', [id]);
+        if (!rows.length) return res.status(404).json({ error: 'Épisode introuvable' });
+        return res.json(rows[0]);
+      }
+
+      return res.status(400).json({ error: 'seriesId ou id requis' });
+    }
+
+    // POST /api/videos/episodes → créer un épisode
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'episodes' && req.method === 'POST') {
+      const user = authenticateToken(req);
+      requireAdmin(user);
+      const { seriesId, episodeNumber, seasonNumber, title, description, thumbnail, videoUrl, duration } = req.body;
+
+      if (!title || !videoUrl || !episodeNumber || !seriesId) {
+        return res.status(400).json({ error: 'Champs requis manquants' });
+      }
+
+      // Vérifier si un épisode avec le même numéro existe déjà
+      const [existingEpisodes] = await executeQuery(
+        'SELECT uuid FROM episodes WHERE "seriesId" = $1 AND "seasonNumber" = $2 AND "episodeNumber" = $3', 
+        [seriesId, seasonNumber || 1, episodeNumber]
+      );
+      
+      if (existingEpisodes.length > 0) {
+        return res.status(409).json({ 
+          error: `Un épisode ${episodeNumber} existe déjà dans la saison ${seasonNumber || 1}.`,
+          code: 'EPISODE_EXISTS'
+        });
+      }
+
+      const newId = uuidv4();
+      await executeQuery(
+        'INSERT INTO episodes (uuid, "seriesId", "episodeNumber", "seasonNumber", title, description, thumbnail, "videoUrl", duration, views, "createdAt", "updatedAt") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
+        [newId, seriesId, episodeNumber, seasonNumber || 1, title, description, thumbnail, videoUrl, duration, 0, new Date(), new Date()]
+      );
+
+      const [episode] = await executeQuery('SELECT uuid as id, title, description, thumbnail, "videoUrl", duration, "episodeNumber", "seasonNumber", views FROM episodes WHERE uuid = $1', [newId]);
+      return res.json(episode[0]);
+    }
+
+    // PUT /api/videos/episodes?id=xxx → modifier un épisode
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'episodes' && req.method === 'PUT') {
+      const user = authenticateToken(req);
+      requireAdmin(user);
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const id = searchParams.get('id');
+
+      if (!id) {
+        return res.status(400).json({ error: 'ID requis' });
+      }
+
+      const { episodeNumber, seasonNumber, title, description, thumbnail, videoUrl, duration } = req.body;
+      const [result] = await executeQuery(
+        'UPDATE episodes SET "episodeNumber" = $1, "seasonNumber" = $2, title = $3, description = $4, thumbnail = $5, "videoUrl" = $6, duration = $7, "updatedAt" = $8 WHERE uuid = $9',
+        [episodeNumber, seasonNumber || 1, title, description, thumbnail, videoUrl, duration, new Date(), id]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ error: 'Épisode non trouvé' });
+
+      const [updated] = await executeQuery('SELECT uuid as id, title, description, thumbnail, "videoUrl", duration, "episodeNumber", "seasonNumber", views FROM episodes WHERE uuid = $1', [id]);
+      return res.json(updated[0]);
+    }
+
+    // DELETE /api/videos/episodes?id=xxx → supprimer un épisode
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'episodes' && req.method === 'DELETE') {
+      const user = authenticateToken(req);
+      requireAdmin(user);
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const id = searchParams.get('id');
+
+      if (!id) {
+        return res.status(400).json({ error: 'ID requis' });
+      }
+
+      const [result] = await executeQuery('DELETE FROM episodes WHERE uuid = $1', [id]);
+      if (result.rowCount === 0) return res.status(404).json({ error: 'Épisode non trouvé' });
+
+      return res.json({ message: 'Épisode supprimé avec succès' });
     }
     
     else {
