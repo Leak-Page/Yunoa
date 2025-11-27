@@ -1030,6 +1030,134 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       }
     }
 
+    // ========== ROUTES CUSTOM STREAMING ==========
+    // POST /api/videos/stream-metadata - Obtenir les métadonnées pour le streaming custom
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream-metadata' && req.method === 'POST') {
+      const user = authenticateToken(req);
+      const { videoId } = req.body;
+
+      if (!videoId) {
+        return res.status(400).json({ error: 'ID de vidéo requis' });
+      }
+
+      // Récupérer les infos de la vidéo
+      const { data: video, error: videoError } = await supabase
+        .from('videos')
+        .select('video_url, title, duration, id')
+        .eq('id', videoId)
+        .single();
+
+      if (videoError || !video || !video.video_url) {
+        return res.status(404).json({ error: 'Vidéo non trouvée' });
+      }
+
+      // Obtenir la taille de la vidéo
+      let totalSize = 0;
+      try {
+        const headResponse = await fetch(video.video_url, { method: 'HEAD' });
+        const contentLength = headResponse.headers.get('content-length');
+        totalSize = contentLength ? parseInt(contentLength) : 0;
+      } catch (error) {
+        console.warn('[CustomStream] Impossible de récupérer la taille de la vidéo');
+      }
+
+      // Calculer les chunks (2MB par chunk pour un bon équilibre)
+      const chunkSize = 2 * 1024 * 1024; // 2MB
+      const totalChunks = totalSize > 0 ? Math.ceil(totalSize / chunkSize) : 100;
+
+      return res.json({
+        duration: video.duration || 0,
+        totalSize,
+        chunkSize,
+        totalChunks
+      });
+    }
+
+    // POST /api/videos/stream-chunk - Récupérer un chunk spécifique
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream-chunk' && req.method === 'POST') {
+      const user = authenticateToken(req);
+      const { videoId, chunkIndex, start, end } = req.body;
+
+      if (!videoId || chunkIndex === undefined || start === undefined || end === undefined) {
+        return res.status(400).json({ error: 'Paramètres manquants' });
+      }
+
+      // Récupérer l'URL de la vidéo
+      const { data: video, error: videoError } = await supabase
+        .from('videos')
+        .select('video_url, id')
+        .eq('id', videoId)
+        .single();
+
+      if (videoError || !video || !video.video_url) {
+        return res.status(404).json({ error: 'Vidéo non trouvée' });
+      }
+
+      // SÉCURITÉ : Vérifier l'User-Agent
+      const userAgent = req.headers['user-agent'] || '';
+      const suspiciousAgents = ['Video DownloadHelper', 'youtube-dl', 'wget', 'curl', 'aria2', 'ffmpeg', 'VLC'];
+      if (suspiciousAgents.some(agent => userAgent.toLowerCase().includes(agent.toLowerCase()))) {
+        logSuspiciousActivity('SUSPICIOUS_USER_AGENT_CHUNK', { 
+          userId: user.id, 
+          videoId, 
+          userAgent,
+          ip: getClientIp(req)
+        });
+        return res.status(403).json({ error: 'Accès refusé' });
+      }
+
+      // SÉCURITÉ : Vérifier le Referer/Origin
+      const referer = req.headers.referer || '';
+      const origin = req.headers.origin || '';
+      const host = req.headers.host || '';
+      const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
+      const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
+      
+      if ((referer || origin) && !isValidReferer && !isValidOrigin) {
+        return res.status(403).json({ error: 'Accès refusé' });
+      }
+
+      // SÉCURITÉ : Limiter la taille des chunks (max 5MB)
+      const chunkSize = end - start + 1;
+      if (chunkSize > 5 * 1024 * 1024) {
+        return res.status(400).json({ error: 'Chunk trop grand' });
+      }
+
+      try {
+        // Faire une requête Range vers la vidéo
+        const videoResponse = await fetch(video.video_url, {
+          headers: {
+            'Range': `bytes=${start}-${end}`
+          }
+        });
+
+        if (!videoResponse.ok && videoResponse.status !== 206) {
+          return res.status(videoResponse.status).json({ error: 'Erreur de récupération chunk' });
+        }
+
+        // Headers de sécurité
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, private');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Disposition', 'inline; filename="chunk.mp4"');
+        
+        if (videoResponse.status === 206) {
+          res.setHeader('Content-Range', videoResponse.headers.get('content-range') || '');
+        }
+
+        res.status(videoResponse.status);
+
+        // Streamer le chunk
+        const buffer = await videoResponse.arrayBuffer();
+        return res.end(Buffer.from(buffer));
+
+      } catch (error) {
+        console.error('[CustomStream] Erreur chunk:', error);
+        return res.status(500).json({ error: 'Erreur serveur' });
+      }
+    }
+
     // ========== ROUTES EPISODES ==========
     // GET /api/videos/episodes?seriesId=xxx → récupérer tous les épisodes d'une série
     else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'episodes' && req.method === 'GET') {

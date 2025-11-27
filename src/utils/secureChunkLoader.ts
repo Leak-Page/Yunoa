@@ -29,35 +29,56 @@ export class SecureChunkLoader {
    * Utilise HLS si disponible, sinon fallback sur le système obfusqué
    */
   async load(): Promise<string> {
-    // NOTE: HLS désactivé car nécessite une conversion préalable des vidéos en format HLS (.ts)
-    // Les vidéos MP4 brutes ne peuvent pas être servies comme segments HLS
-    // Utiliser directement le système obfusqué qui fonctionne avec MP4
-    console.log('[SecureChunkLoader] 🚀 Utilisation du système de streaming obfusqué (HLS nécessite conversion préalable)');
-    
-    // Utiliser directement le système obfusqué
-    const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
-    
-    const obfuscatedLoader = new ObfuscatedStreamLoader({
-      videoUrl: this.options.videoUrl,
-      videoId: this.options.videoId,
-      sessionToken: this.currentToken,
-      videoElement: this.options.videoElement,
-      onProgress: (loaded, total) => {
-        if (this.options.onProgress) {
-          this.options.onProgress(loaded, total);
-        }
-      },
-      onError: (error) => {
-        console.error('[SecureChunkLoader] ❌ Erreur:', error);
-        this.options.onError?.(error);
-      },
-      signal: this.options.signal
-    });
+    // Utiliser le système de streaming personnalisé (custom)
+    try {
+      const { CustomStreamLoader } = await import('@/utils/customStreamLoader');
+      
+      const customLoader = new CustomStreamLoader({
+        videoUrl: this.options.videoUrl,
+        videoId: this.options.videoId,
+        sessionToken: this.currentToken,
+        videoElement: this.options.videoElement!,
+        onProgress: (loaded, total) => {
+          if (this.options.onProgress) {
+            this.options.onProgress(loaded, total);
+          }
+        },
+        onError: (error) => {
+          console.error('[SecureChunkLoader] ❌ Erreur:', error);
+          this.options.onError?.(error);
+        },
+        signal: this.options.signal
+      });
 
-    // Stocker le loader pour le cleanup
-    this.obfuscatedLoader = obfuscatedLoader;
+      // Stocker le loader pour le cleanup
+      (this as any).customLoader = customLoader;
 
-    return await obfuscatedLoader.load();
+      return await customLoader.load();
+    } catch (error) {
+      console.warn('[SecureChunkLoader] ⚠️ Système custom non disponible, fallback:', error);
+      
+      // Fallback sur le système obfusqué
+      const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
+      
+      this.obfuscatedLoader = new ObfuscatedStreamLoader({
+        videoUrl: this.options.videoUrl,
+        videoId: this.options.videoId,
+        sessionToken: this.currentToken,
+        videoElement: this.options.videoElement,
+        onProgress: (loaded, total) => {
+          if (this.options.onProgress) {
+            this.options.onProgress(loaded, total);
+          }
+        },
+        onError: (error) => {
+          console.error('[SecureChunkLoader] ❌ Erreur:', error);
+          this.options.onError?.(error);
+        },
+        signal: this.options.signal
+      });
+
+      return await this.obfuscatedLoader.load();
+    }
   }
 
   /**
@@ -68,6 +89,10 @@ export class SecureChunkLoader {
     
     if (this.hlsPlayer) {
       this.hlsPlayer.cleanup();
+    }
+    
+    if ((this as any).customLoader) {
+      (this as any).customLoader.abort();
     }
     
     if (this.obfuscatedLoader) {
@@ -85,6 +110,11 @@ export class SecureChunkLoader {
     if (this.hlsPlayer) {
       this.hlsPlayer.cleanup();
       this.hlsPlayer = null;
+    }
+    
+    if ((this as any).customLoader) {
+      (this as any).customLoader.cleanup();
+      (this as any).customLoader = null;
     }
     
     if (this.obfuscatedLoader) {
