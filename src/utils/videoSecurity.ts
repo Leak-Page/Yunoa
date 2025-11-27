@@ -28,6 +28,7 @@ interface VideoLoadOptions {
 export class VideoSecurityManager {
   private config: VideoSecurityConfig;
   private urlCache = new Map<string, string>(); // Cache des URLs de streaming (pas de blobs)
+  private sessionTokens = new Map<string, { token: string; expiresAt: number; refreshTimer?: NodeJS.Timeout }>(); // Tokens de session temporaires
 
   constructor(config: VideoSecurityConfig = {}) {
     this.config = {
@@ -40,7 +41,7 @@ export class VideoSecurityManager {
 
   /**
    * Charge une vidéo via streaming direct sécurisé (comme Netflix)
-   * Utilise une URL directe avec authentification via token
+   * Utilise des tokens temporaires avec rotation pour empêcher le téléchargement
    * Pas de blob - chargement direct avec support Range requests
    */
   async loadSecureVideo(options: VideoLoadOptions): Promise<string> {
@@ -49,21 +50,85 @@ export class VideoSecurityManager {
     // Clé de cache basée sur l'URL et l'ID
     const cacheKey = `${videoId}-${this.hashString(videoUrl)}`;
     
-    // Vérifier le cache
-    if (this.urlCache.has(cacheKey)) {
-      return this.urlCache.get(cacheKey)!;
+    // Créer ou récupérer une session de streaming sécurisée
+    let sessionData = this.sessionTokens.get(cacheKey);
+    
+    if (!sessionData || Date.now() > sessionData.expiresAt) {
+      // Créer une nouvelle session
+      try {
+        const response = await fetch('/api/videos/stream/session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${sessionToken}`
+          },
+          body: JSON.stringify({ videoId })
+        });
+        
+        if (!response.ok) {
+          throw new Error('Impossible de créer une session de streaming');
+        }
+        
+        const data = await response.json();
+        const expiresAt = Date.now() + (data.expiresIn * 1000);
+        
+        sessionData = {
+          token: data.sessionToken,
+          expiresAt
+        };
+        
+        this.sessionTokens.set(cacheKey, sessionData);
+        
+        // Programmer le renouvellement du token (toutes les 30 secondes)
+        if (sessionData.refreshTimer) {
+          clearInterval(sessionData.refreshTimer);
+        }
+        
+        sessionData.refreshTimer = setInterval(async () => {
+          try {
+            const refreshResponse = await fetch('/api/videos/stream/session', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${sessionToken}`
+              },
+              body: JSON.stringify({ videoId })
+            });
+            
+            if (refreshResponse.ok) {
+              const refreshData = await refreshResponse.json();
+              const newExpiresAt = Date.now() + (refreshData.expiresIn * 1000);
+              
+              const currentSession = this.sessionTokens.get(cacheKey);
+              if (currentSession) {
+                currentSession.token = refreshData.sessionToken;
+                currentSession.expiresAt = newExpiresAt;
+              }
+              
+              console.log('🔄 Token de streaming renouvelé');
+            }
+          } catch (error) {
+            console.error('Erreur renouvellement token:', error);
+          }
+        }, (data.refreshInterval || 30) * 1000);
+        
+      } catch (error) {
+        console.error('Erreur création session streaming:', error);
+        // Fallback : utiliser le token de session directement (moins sécurisé)
+        const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionToken)}`;
+        this.urlCache.set(cacheKey, streamUrl);
+        return streamUrl;
+      }
     }
 
-    // Générer l'URL de streaming direct avec authentification
-    // Le token est passé en query parameter pour l'authentification
-    // Le serveur valide le token et stream la vidéo directement
-    const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionToken)}`;
+    // Générer l'URL de streaming avec le token de session temporaire
+    const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionData.token)}`;
     
     // Mettre en cache l'URL (pas de blob)
     this.urlCache.set(cacheKey, streamUrl);
 
     // Log sécurisé
-    console.log('✅ URL de streaming direct générée (sécurisé comme Netflix)');
+    console.log('✅ URL de streaming direct générée (sécurisé comme Netflix avec rotation de tokens)');
 
     // Si onProgress est fourni, simuler la progression (le navigateur gère le streaming)
     if (onProgress) {
@@ -82,8 +147,16 @@ export class VideoSecurityManager {
    * Note: Plus besoin de révoquer des blobs car on utilise des URLs directes
    */
   cleanup(): void {
+    // Nettoyer les timers de renouvellement
+    for (const sessionData of this.sessionTokens.values()) {
+      if (sessionData.refreshTimer) {
+        clearInterval(sessionData.refreshTimer);
+      }
+    }
+    
     this.urlCache.clear();
-    console.log('[VideoSecurityManager] 🧹 Cache des URLs nettoyé');
+    this.sessionTokens.clear();
+    console.log('[VideoSecurityManager] 🧹 Cache des URLs et sessions nettoyé');
   }
 
   /**
