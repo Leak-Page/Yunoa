@@ -3,8 +3,7 @@ import { clientFingerprint } from './clientFingerprint';
 /**
  * Système de streaming optimisé type Netflix
  * - Démarrage ultra-rapide (2-3 segments seulement)
- * - Chargement parallèle intelligent avec priorités
- * - Gestion adaptative de la qualité réseau
+ * - Chargement séquentiel optimisé (compatible serveur)
  * - Buffer prédictif basé sur la position de lecture
  */
 
@@ -49,9 +48,13 @@ export class StreamingMSELoader {
   // Cache des segments chargés
   private segmentCache = new Map<number, ArrayBuffer>();
   private loadingSegments = new Set<number>();
+  
+  // Statistiques réseau pour monitoring
+  private downloadSpeeds: number[] = [];
+  private avgDownloadSpeed = 0;
 
   constructor(private options: StreamingLoaderOptions) {
-    this.chunkSize = options.chunkSize || 512 * 1024; // 512KB par défaut (plus petit = plus rapide au démarrage)
+    this.chunkSize = options.chunkSize || 1024 * 1024; // 1MB par défaut pour un bon équilibre vitesse/qualité
     this.currentToken = options.sessionToken;
   }
 
@@ -75,86 +78,91 @@ export class StreamingMSELoader {
 
   /**
    * Streaming adaptatif type Netflix
-   * Stratégie:
-   * 1. Démarrer TRÈS rapidement avec 2-3 segments
-   * 2. Charger en parallèle les segments suivants
-   * 3. Prédire les besoins basés sur la position de lecture
-   * 4. Adapter le nombre de connexions parallèles selon le réseau
+   * Stratégie optimisée:
+   * 1. Charger séquentiellement les premiers segments rapidement
+   * 2. Démarrer la vidéo dès que 2-3 segments sont chargés
+   * 3. Continuer le chargement séquentiel en arrière-plan
+   * 4. Mettre à jour le blob intelligemment
    */
   private async loadWithAdaptiveStreaming(): Promise<string> {
     const videoElement = this.options.videoElement;
     
-    // ÉTAPE 1: Démarrage ultra-rapide avec segments initiaux
-    const INITIAL_SEGMENTS = 3; // 2-3 segments = ~1-2 secondes de vidéo
-    const initialSegments = await this.loadInitialSegments(INITIAL_SEGMENTS);
+    // Stratégie: Démarrer avec seulement 2-3 segments pour un démarrage ultra-rapide
+    const MIN_SEGMENTS_TO_START = Math.min(3, this.totalChunks); // Maximum 3 segments pour démarrer
     
-    // Créer et démarrer la vidéo immédiatement
-    const blob = new Blob([...initialSegments.values()], { type: 'video/mp4' });
-    const blobUrl = URL.createObjectURL(blob);
-    videoElement.src = blobUrl;
-    videoElement.load();
+    console.log(`[StreamingMSE] 🚀 Chargement séquentiel optimisé, démarrage à ${MIN_SEGMENTS_TO_START} segments`);
     
-    console.log(`[StreamingMSE] 🎬 Vidéo prête (${INITIAL_SEGMENTS} segments) - Démarrage instantané`);
+    let videoStarted = false;
+    let currentBlobUrl = '';
     
-    // ÉTAPE 2: Charger le reste en arrière-plan de manière intelligente
-    this.startBackgroundLoading(INITIAL_SEGMENTS);
-    
-    // ÉTAPE 3: Surveiller et mettre à jour le blob quand nécessaire
-    this.startSmartBuffering(blobUrl);
-    
-    return blobUrl;
-  }
-
-  /**
-   * Charge les segments initiaux séquentiellement pour un démarrage rapide
-   * Le serveur exige un chargement séquentiel strict (0, 1, 2, 3...)
-   */
-  private async loadInitialSegments(count: number): Promise<Map<number, ArrayBuffer>> {
-    // Charger séquentiellement les premiers segments
-    for (let i = 0; i < Math.min(count, this.totalChunks); i++) {
-      await this.loadSegmentWithRetry(i);
-    }
-    
-    return this.segmentCache;
-  }
-
-  /**
-   * Charge les segments restants en arrière-plan de manière séquentielle
-   * Le serveur exige un chargement séquentiel strict
-   */
-  private startBackgroundLoading(startIndex: number): void {
-    const loadNext = async () => {
-      if (this.isAborted || this.options.signal?.aborted) return;
+    // Fonction pour démarrer la vidéo dès qu'on a assez de segments
+    const tryStartVideo = () => {
+      if (videoStarted || this.segmentCache.size < MIN_SEGMENTS_TO_START) return;
       
-      // Trouver le prochain segment à charger (séquentiel)
-      let nextIndex = startIndex;
-      while (nextIndex < this.totalChunks) {
-        if (!this.segmentCache.has(nextIndex) && !this.loadingSegments.has(nextIndex)) {
-          break;
-        }
-        nextIndex++;
+      // Créer le blob avec les segments disponibles (dans l'ordre séquentiel)
+      const segments: ArrayBuffer[] = [];
+      for (let i = 0; i < this.totalChunks; i++) {
+        const segment = this.segmentCache.get(i);
+        if (segment) segments.push(segment);
+        else break; // Arrêter si un segment manque (séquentiel)
       }
       
-      if (nextIndex >= this.totalChunks) {
-        console.log('[StreamingMSE] ✅ Tous les segments chargés');
-        return;
-      }
+      if (segments.length < MIN_SEGMENTS_TO_START) return;
       
-      // Charger le segment suivant
-      try {
-        await this.loadSegmentWithRetry(nextIndex);
-        this.updateProgress();
-        
-        // Continuer immédiatement avec le segment suivant
-        loadNext();
-      } catch (error) {
-        // En cas d'erreur, réessayer après un court délai
-        setTimeout(loadNext, 500);
-      }
+      const blob = new Blob(segments, { type: 'video/mp4' });
+      currentBlobUrl = URL.createObjectURL(blob);
+      videoElement.src = currentBlobUrl;
+      videoElement.load();
+      videoStarted = true;
+      
+      console.log(`[StreamingMSE] 🎬 Vidéo prête (${segments.length}/${this.totalChunks} segments) - Démarrage ultra-rapide`);
+      
+      // Surveiller le buffer une fois la vidéo démarrée
+      this.startSmartBuffering(currentBlobUrl);
     };
     
-    // Démarrer le chargement en arrière-plan
-    loadNext();
+    // Charger tous les segments séquentiellement
+    const loadAllSegments = async () => {
+      for (let i = 0; i < this.totalChunks; i++) {
+        if (this.isAborted || this.options.signal?.aborted) break;
+        
+        try {
+          await this.loadSegmentWithRetry(i);
+          this.updateProgress();
+          
+          // Essayer de démarrer la vidéo après chaque segment chargé
+          if (!videoStarted) {
+            tryStartVideo();
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage.includes('Session expirée')) {
+            this.options.onError?.(new Error('Session expirée - veuillez recharger la vidéo'));
+            break;
+          }
+          // Continuer avec le segment suivant en cas d'erreur
+          console.warn(`[StreamingMSE] ⚠️ Erreur segment ${i}, passage au suivant`);
+        }
+      }
+      
+      console.log('[StreamingMSE] ✅ Tous les segments chargés');
+    };
+    
+    // Démarrer le chargement séquentiel
+    loadAllSegments();
+    
+    // Attendre que la vidéo démarre (maximum 5 secondes)
+    const startTime = Date.now();
+    while (!videoStarted && Date.now() - startTime < 5000) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    if (!videoStarted && this.segmentCache.size > 0) {
+      // Forcer le démarrage même si on n'a pas atteint le minimum
+      tryStartVideo();
+    }
+    
+    return currentBlobUrl || '';
   }
 
   /**
@@ -162,10 +170,14 @@ export class StreamingMSELoader {
    */
   private startSmartBuffering(initialBlobUrl: string): void {
     let currentBlobUrl = initialBlobUrl;
-    let lastBlobUpdateSegments = 3;
+    let lastBlobUpdateSegments = 0;
+    let isUpdating = false;
     
     const checkBuffer = () => {
-      if (this.isAborted) return;
+      if (this.isAborted || isUpdating) {
+        requestAnimationFrame(checkBuffer);
+        return;
+      }
       
       const videoElement = this.options.videoElement;
       if (!videoElement.buffered.length) {
@@ -182,18 +194,26 @@ export class StreamingMSELoader {
       // Prédire les besoins: mettre à jour si on approche de la fin du buffer
       // ou si on a chargé significativement plus de segments
       const shouldUpdate = 
-        (bufferAhead < 15 && loadedSegments > lastBlobUpdateSegments + 5) || // Buffer faible
+        (bufferAhead < 10 && loadedSegments > lastBlobUpdateSegments + 5) || // Buffer faible
         (loadedSegments === this.totalChunks && loadedSegments > lastBlobUpdateSegments) || // Tout chargé
-        (duration - currentTime < 30 && loadedSegments > lastBlobUpdateSegments + 3); // Proche de la fin
+        (duration > 0 && duration - currentTime < 20 && loadedSegments > lastBlobUpdateSegments + 3); // Proche de la fin
       
       if (shouldUpdate) {
+        isUpdating = true;
         console.log(`[StreamingMSE] 📊 Mise à jour blob: ${loadedSegments}/${this.totalChunks} segments (buffer: ${bufferAhead.toFixed(1)}s)`);
         
-        // Créer le nouveau blob avec tous les segments chargés
+        // Créer le nouveau blob avec tous les segments chargés (dans l'ordre séquentiel)
         const allSegments: ArrayBuffer[] = [];
         for (let i = 0; i < this.totalChunks; i++) {
           const segment = this.segmentCache.get(i);
           if (segment) allSegments.push(segment);
+          else break; // Arrêter si un segment manque (séquentiel)
+        }
+        
+        if (allSegments.length === 0) {
+          isUpdating = false;
+          requestAnimationFrame(checkBuffer);
+          return;
         }
         
         const newBlob = new Blob(allSegments, { type: 'video/mp4' });
@@ -203,11 +223,34 @@ export class StreamingMSELoader {
         const wasPlaying = !videoElement.paused;
         const savedTime = currentTime;
         
+        const restorePlayback = () => {
+          if (savedTime > 0 && duration > 0 && savedTime < duration) {
+            videoElement.currentTime = savedTime;
+          }
+          setTimeout(() => {
+            if (wasPlaying && videoElement.paused) {
+              videoElement.play().catch(() => {});
+            }
+            isUpdating = false;
+          }, 200);
+        };
+        
+        const handleCanPlay = () => {
+          videoElement.removeEventListener('canplay', handleCanPlay);
+          videoElement.removeEventListener('loadeddata', handleLoadedData);
+          restorePlayback();
+        };
+        
+        const handleLoadedData = () => {
+          videoElement.removeEventListener('loadeddata', handleLoadedData);
+          videoElement.removeEventListener('canplay', handleCanPlay);
+          restorePlayback();
+        };
+        
+        videoElement.addEventListener('canplay', handleCanPlay, { once: true });
+        videoElement.addEventListener('loadeddata', handleLoadedData, { once: true });
         videoElement.src = newBlobUrl;
-        videoElement.currentTime = savedTime;
-        if (wasPlaying) {
-          videoElement.play().catch(() => {});
-        }
+        videoElement.load();
         
         URL.revokeObjectURL(currentBlobUrl);
         currentBlobUrl = newBlobUrl;
@@ -232,8 +275,18 @@ export class StreamingMSELoader {
     
     for (let retry = 0; retry <= maxRetries; retry++) {
       try {
-        // Charger le segment
+        const startTime = Date.now();
         const segment = await this.fetchSegment(index);
+        const downloadTime = (Date.now() - startTime) / 1000;
+        
+        // Calculer la vitesse de téléchargement (MB/s)
+        const sizeMB = segment.data.byteLength / (1024 * 1024);
+        const speed = sizeMB / downloadTime;
+        
+        // Mettre à jour les statistiques réseau
+        this.downloadSpeeds.push(speed);
+        if (this.downloadSpeeds.length > 10) this.downloadSpeeds.shift();
+        this.avgDownloadSpeed = this.downloadSpeeds.reduce((a, b) => a + b, 0) / this.downloadSpeeds.length;
         
         // Sauvegarder le segment
         this.segmentCache.set(index, segment.data);
