@@ -70,7 +70,10 @@ export class CustomStreamLoader {
         await this.loadInitialChunks();
       } catch (chunkError) {
         console.warn('[CustomStream] ⚠️ Erreur lors du chargement des chunks, MediaSource ne peut pas utiliser des MP4 bruts');
-        throw new Error('Chunks MP4 bruts non compatibles avec MediaSource');
+        // Nettoyer MediaSource avant de propager l'erreur
+        this.cleanup();
+        // Propager l'erreur originale pour que le fallback soit déclenché
+        throw chunkError;
       }
 
       // Étape 4: Démarrer le chargement progressif
@@ -200,8 +203,21 @@ export class CustomStreamLoader {
     console.log('[CustomStream] 📦 Chargement des chunks initiaux:', initialChunks);
 
     // Charger le premier chunk d'abord (séquentiel pour MediaSource)
-    for (const index of initialChunks) {
-      await this.loadChunk(index);
+    // Si le premier chunk échoue, on propage l'erreur immédiatement
+    try {
+      await this.loadChunk(initialChunks[0]);
+    } catch (error) {
+      // Si le premier chunk échoue, MediaSource ne peut pas fonctionner
+      console.error('[CustomStream] ❌ Échec du chargement du premier chunk, MediaSource non compatible');
+      throw error;
+    }
+    
+    // Charger les autres chunks en parallèle (mais ne pas bloquer si certains échouent)
+    const remainingChunks = initialChunks.slice(1);
+    for (const index of remainingChunks) {
+      this.loadChunk(index).catch(err => {
+        console.warn(`[CustomStream] ⚠️ Chunk ${index} échoué (non bloquant):`, err);
+      });
     }
   }
 
@@ -257,6 +273,8 @@ export class CustomStreamLoader {
       console.error(`[CustomStream] ❌ Erreur chunk ${index}:`, error);
       this.loadedChunks.delete(index);
       this.options.onError?.(error as Error);
+      // Propager l'erreur pour déclencher le fallback
+      throw error;
     } finally {
       this.activeRequests--;
       this.processQueue();
@@ -319,28 +337,41 @@ export class CustomStreamLoader {
         return;
       }
 
+      let errorOccurred = false;
+      
+      // Écouter l'erreur AVANT d'ajouter le buffer
+      const errorHandler = (e: Event) => {
+        if (!errorOccurred) {
+          errorOccurred = true;
+          console.error('[CustomStream] ❌ Erreur lors de l\'ajout au buffer:', e);
+          // MediaSource ne peut pas utiliser des chunks MP4 bruts
+          reject(new Error('MediaSource ne peut pas utiliser des chunks MP4 bruts - nécessite des fragments MP4 (fMP4)'));
+        }
+      };
+      
+      this.sourceBuffer!.addEventListener('error', errorHandler, { once: true });
+
       try {
         console.log(`[CustomStream] 📤 Ajout de ${chunk.data.byteLength} bytes au SourceBuffer...`);
         this.sourceBuffer!.appendBuffer(chunk.data);
         
         this.sourceBuffer!.addEventListener('updateend', () => {
-          console.log(`[CustomStream] ✅ Chunk ${chunk.index} ajouté au buffer`);
-          // Mettre à jour la progression
-          if (this.options.onProgress && this.videoMetadata) {
-            const loaded = (this.currentChunkIndex / this.videoMetadata.totalChunks) * 100;
-            this.options.onProgress(loaded, 100);
+          if (!errorOccurred) {
+            console.log(`[CustomStream] ✅ Chunk ${chunk.index} ajouté au buffer`);
+            // Mettre à jour la progression
+            if (this.options.onProgress && this.videoMetadata) {
+              const loaded = (this.currentChunkIndex / this.videoMetadata.totalChunks) * 100;
+              this.options.onProgress(loaded, 100);
+            }
+            resolve();
           }
-          resolve();
-        }, { once: true });
-        
-        this.sourceBuffer!.addEventListener('error', (e) => {
-          console.error('[CustomStream] ❌ Erreur lors de l\'ajout au buffer:', e);
-          // MediaSource ne peut pas utiliser des chunks MP4 bruts
-          reject(new Error('MediaSource ne peut pas utiliser des chunks MP4 bruts - nécessite des fragments MP4 (fMP4)'));
         }, { once: true });
       } catch (error) {
-        console.error('[CustomStream] ❌ Exception lors de appendBuffer:', error);
-        reject(error);
+        if (!errorOccurred) {
+          errorOccurred = true;
+          console.error('[CustomStream] ❌ Exception lors de appendBuffer:', error);
+          reject(error);
+        }
       }
     });
   }

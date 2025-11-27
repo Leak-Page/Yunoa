@@ -55,7 +55,7 @@ export class SecureChunkLoader {
 
       return await customLoader.load();
       } catch (error) {
-      console.warn('[SecureChunkLoader] ⚠️ Système custom non disponible, fallback:', error);
+      console.warn('[SecureChunkLoader] ⚠️ Système custom non disponible (MediaSource ne peut pas utiliser des MP4 bruts), basculement vers le système obfusqué:', error);
       
       // Fallback sur le système obfusqué
       const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
