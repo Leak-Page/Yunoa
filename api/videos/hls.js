@@ -266,20 +266,4 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
   }
 };
 
-/**
- * Récupère un segment avec watermarking
- * TODO: Implémenter la conversion MP4 → HLS et le watermarking dynamique
- */
-async function getSegmentWithWatermark(session, segmentIndex) {
-  // Pour l'instant, retourner un segment factice
-  // Vous devrez :
-  // 1. Convertir le MP4 en segments HLS (.ts)
-  // 2. Ajouter un watermark avec l'ID utilisateur/email
-  // 3. Retourner le segment
-  
-  // Exemple avec FFmpeg (à implémenter côté serveur):
-  // ffmpeg -i input.mp4 -vf "drawtext=text='${session.userEmail}':fontsize=24:fontcolor=white@0.5:x=10:y=10" -c:v libx264 -c:a aac -f hls -hls_time 10 -hls_list_size 0 output.m3u8
-  
-  return Buffer.from([]); // Segment factice
-}
 
