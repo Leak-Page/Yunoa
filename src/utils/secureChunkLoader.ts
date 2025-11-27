@@ -33,44 +33,58 @@ export class SecureChunkLoader {
     try {
       const { HLSPlayer } = await import('@/utils/hlsPlayer');
       
+      // Vérifier si HLS est supporté
+      if (!HLSPlayer.isSupported()) {
+        throw new Error('HLS non supporté');
+      }
+      
       // Obtenir la playlist HLS
       const response = await fetch('/api/videos/hls/playlist', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.currentToken}`
-      },
-      body: JSON.stringify({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.currentToken}`
+        },
+        body: JSON.stringify({
           videoId: this.options.videoId
-      }),
-      signal: this.options.signal
-    });
+        }),
+        signal: this.options.signal
+      });
 
-      if (response.ok) {
-        const data = await response.json();
-        const hlsPlayer = new HLSPlayer({
-          videoElement: this.options.videoElement!,
-          playlistUrl: data.playlistUrl,
-          sessionToken: this.currentToken,
-          onProgress: (progress) => {
-            if (this.options.onProgress) {
-              // Convertir le pourcentage en bytes approximatifs
-              this.options.onProgress(progress, 100);
-            }
-          },
-          onError: (error) => {
-            console.error('[SecureChunkLoader] ❌ Erreur HLS:', error);
-          }
-        });
-
-        await hlsPlayer.load();
-        this.hlsPlayer = hlsPlayer;
-        
-        console.log('[SecureChunkLoader] 🚀 Utilisation du système HLS sécurisé');
-        return data.playlistUrl;
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Erreur inconnue' }));
+        throw new Error(`Erreur API HLS: ${response.status} - ${errorData.error || 'Erreur inconnue'}`);
       }
+
+      const data = await response.json();
+      
+      if (!data.playlistUrl) {
+        throw new Error('Playlist URL manquante dans la réponse');
+      }
+      
+      const hlsPlayer = new HLSPlayer({
+        videoElement: this.options.videoElement!,
+        playlistUrl: data.playlistUrl,
+        sessionToken: this.currentToken,
+        onProgress: (progress) => {
+          if (this.options.onProgress) {
+            // Convertir le pourcentage en bytes approximatifs
+            this.options.onProgress(progress, 100);
+          }
+        },
+        onError: (error) => {
+          console.error('[SecureChunkLoader] ❌ Erreur HLS:', error);
+          this.options.onError?.(error);
+        }
+      });
+
+      await hlsPlayer.load();
+      this.hlsPlayer = hlsPlayer;
+      
+      console.log('[SecureChunkLoader] 🚀 Utilisation du système HLS sécurisé');
+      return data.playlistUrl;
     } catch (error) {
-      console.warn('[SecureChunkLoader] ⚠️ HLS non disponible, utilisation du fallback');
+      console.warn('[SecureChunkLoader] ⚠️ HLS non disponible, utilisation du fallback:', error);
     }
 
     // Fallback sur le système obfusqué

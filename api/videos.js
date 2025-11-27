@@ -29,8 +29,10 @@ const requestTracker = new Map(); // IP -> { count, lastRequest, videoId }
 setInterval(() => {
   const now = Date.now();
   for (const [key, data] of secureStreams.entries()) {
-    if (now > data.expiresAt) {
+    // Ne supprimer que si la session est vraiment expirée (avec une marge de 1 minute)
+    if (now > (data.expiresAt + 60 * 1000)) {
       secureStreams.delete(key);
+      console.log('[Cleanup] Session supprimée:', key.substring(0, 16) + '...', 'type:', data.type || 'unknown');
     }
   }
   // Nettoyer le cache des chunks après 5 minutes
@@ -824,6 +826,8 @@ export default async (req, res) => {
         type: 'hls'
       });
 
+      console.log('[HLS] Session créée:', sessionId.substring(0, 16) + '...', 'pour videoId:', videoId);
+
       // Générer la playlist HLS avec watermarking
       const playlistUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/hls/playlist.m3u8?token=${encodeURIComponent(token)}`;
       
@@ -845,9 +849,27 @@ export default async (req, res) => {
 
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // Vérifier que le token contient sessionId
+        if (!decoded.sessionId) {
+          console.error('[HLS Playlist] Token sans sessionId');
+          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
+        }
+        
         const session = secureStreams.get(decoded.sessionId);
 
-        if (!session || Date.now() > session.expiresAt || session.type !== 'hls') {
+        if (!session) {
+          console.error('[HLS Playlist] Session non trouvée:', decoded.sessionId);
+          return res.status(401).json({ error: 'Session non trouvée' });
+        }
+        
+        if (session.type !== 'hls') {
+          console.error('[HLS Playlist] Type de session incorrect:', session.type);
+          return res.status(401).json({ error: 'Type de session incorrect' });
+        }
+        
+        if (Date.now() > session.expiresAt) {
+          console.error('[HLS Playlist] Session expirée');
           return res.status(401).json({ error: 'Session expirée' });
         }
 
@@ -871,6 +893,13 @@ export default async (req, res) => {
 
         // Générer la playlist HLS avec segments signés
         const baseUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/hls`;
+        
+        // Vérifier que decoded.sessionId existe
+        if (!decoded.sessionId) {
+          console.error('[HLS Playlist] decoded.sessionId manquant dans le token');
+          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
+        }
+        
         const segmentToken = jwt.sign(
           {
             sessionId: decoded.sessionId,
@@ -881,6 +910,8 @@ export default async (req, res) => {
           },
           JWT_SECRET
         );
+        
+        console.log('[HLS Playlist] Token de segment généré pour sessionId:', decoded.sessionId.substring(0, 16) + '...');
 
         // Obtenir la taille de la vidéo pour générer la playlist
         let videoSize = 0;
@@ -934,9 +965,27 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
 
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // Vérifier que le token contient sessionId
+        if (!decoded.sessionId) {
+          console.error('[HLS Segment] Token sans sessionId');
+          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
+        }
+        
         const session = secureStreams.get(decoded.sessionId);
 
-        if (!session || Date.now() > session.expiresAt || session.type !== 'hls') {
+        if (!session) {
+          console.error('[HLS Segment] Session non trouvée:', decoded.sessionId);
+          return res.status(401).json({ error: 'Session non trouvée' });
+        }
+        
+        if (session.type !== 'hls') {
+          console.error('[HLS Segment] Type de session incorrect:', session.type);
+          return res.status(401).json({ error: 'Type de session incorrect' });
+        }
+        
+        if (Date.now() > session.expiresAt) {
+          console.error('[HLS Segment] Session expirée');
           return res.status(401).json({ error: 'Session expirée' });
         }
 
@@ -984,7 +1033,8 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
         return res.end(Buffer.from(buffer));
 
       } catch (error) {
-        return res.status(401).json({ error: 'Token invalide' });
+        console.error('[HLS Segment] Erreur:', error);
+        return res.status(401).json({ error: 'Token invalide', details: error.message });
       }
     }
 

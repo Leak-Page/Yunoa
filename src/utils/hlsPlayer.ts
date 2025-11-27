@@ -23,6 +23,17 @@ export class HLSPlayer {
   }
 
   /**
+   * Vérifie si HLS est supporté par le navigateur
+   */
+  static isSupported(): boolean {
+    try {
+      return typeof Hls !== 'undefined' && Hls.isSupported();
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
    * Initialise le lecteur HLS avec protections
    */
   async load(): Promise<void> {
@@ -33,9 +44,9 @@ export class HLSPlayer {
         lowLatencyMode: false,
         backBufferLength: 90,
         xhrSetup: (xhr, url) => {
-          // Ajouter les headers de sécurité
-          xhr.setRequestHeader('Referer', window.location.origin);
-          xhr.setRequestHeader('Origin', window.location.origin);
+          // Note: Les navigateurs bloquent la définition manuelle de Referer et Origin
+          // Ces headers sont automatiquement définis par le navigateur
+          // On peut ajouter d'autres headers personnalisés si nécessaire
         }
       });
 
