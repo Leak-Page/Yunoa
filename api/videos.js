@@ -481,6 +481,172 @@ export default async (req, res) => {
        return res.end(Buffer.from(chunkData));
     }
     
+    // GET /api/videos/stream/:videoId - Streaming direct sécurisé (comme Netflix)
+    else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && req.method === 'GET') {
+      const videoId = pathParts[3];
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const token = req.headers.authorization?.replace('Bearer ', '') || searchParams.get('token');
+      
+      if (!token) {
+        return res.status(401).json({ error: 'Token d\'authentification requis' });
+      }
+
+      try {
+        const user = authenticateToken(req);
+        const clientIp = getClientIp(req);
+        
+        // Vérifier les abus
+        const abuseCheck = detectAbusePatterns(user.id, videoId);
+        if (abuseCheck.isAbuse) {
+          logSuspiciousActivity('ABUSE_DETECTED', { 
+            userId: user.id, 
+            videoId, 
+            reason: abuseCheck.reason,
+            ip: clientIp 
+          });
+          return res.status(429).json({ 
+            error: 'Trop de requêtes détectées',
+            code: 'RATE_LIMITED' 
+          });
+        }
+        
+        // Vérifier les streams simultanés
+        const streamCheck = checkConcurrentStreams(user.id, videoId);
+        if (!streamCheck.allowed) {
+          return res.status(429).json({ 
+            error: streamCheck.message,
+            code: 'TOO_MANY_STREAMS' 
+          });
+        }
+
+        // Récupérer l'URL de la vidéo ou de l'épisode
+        let videoUrl = null;
+        let videoTitle = null;
+        
+        // Essayer d'abord comme vidéo
+        const { data: video, error: videoError } = await supabase
+          .from('videos')
+          .select('video_url, title')
+          .eq('id', videoId)
+          .single();
+
+        if (video && !videoError) {
+          videoUrl = video.video_url;
+          videoTitle = video.title;
+        } else {
+          // Si ce n'est pas une vidéo, essayer comme épisode
+          const { data: episode, error: episodeError } = await supabase
+            .from('episodes')
+            .select('video_url, title')
+            .eq('id', videoId)
+            .single();
+
+          if (episode && !episodeError) {
+            videoUrl = episode.video_url;
+            videoTitle = episode.title;
+          } else {
+            return res.status(404).json({ error: 'Vidéo ou épisode non trouvé' });
+          }
+        }
+
+        if (!videoUrl) {
+          return res.status(404).json({ error: 'URL vidéo non trouvée' });
+        }
+
+        // Obtenir les headers Range si présents (pour le streaming progressif)
+        const range = req.headers.range;
+        
+        // Faire une requête HEAD pour obtenir les métadonnées de la vidéo
+        const headResponse = await fetch(videoUrl, { method: 'HEAD' });
+        const contentLength = parseInt(headResponse.headers.get('content-length') || '0');
+        const contentType = headResponse.headers.get('content-type') || 'video/mp4';
+        const acceptRanges = headResponse.headers.get('accept-ranges') || 'bytes';
+
+        if (range) {
+          // Streaming avec Range request (progressive)
+          const parts = range.replace(/bytes=/, '').split('-');
+          const start = parseInt(parts[0], 10);
+          const end = parts[1] ? parseInt(parts[1], 10) : contentLength - 1;
+          const chunksize = (end - start) + 1;
+
+          // Récupérer le chunk de la vidéo
+          const videoResponse = await fetch(videoUrl, {
+            headers: {
+              'Range': `bytes=${start}-${end}`
+            }
+          });
+
+          if (!videoResponse.ok) {
+            return res.status(502).json({ error: 'Erreur de récupération vidéo' });
+          }
+
+          const chunkData = await videoResponse.arrayBuffer();
+
+          // Envoyer la réponse avec les headers appropriés
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${contentLength}`,
+            'Accept-Ranges': acceptRanges,
+            'Content-Length': chunksize,
+            'Content-Type': contentType,
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'X-Content-Type-Options': 'nosniff'
+          });
+
+          return res.end(Buffer.from(chunkData));
+        } else {
+          // Streaming complet (sans Range)
+          const videoResponse = await fetch(videoUrl);
+
+          if (!videoResponse.ok) {
+            return res.status(502).json({ error: 'Erreur de récupération vidéo' });
+          }
+
+          // Copier les headers importants
+          res.writeHead(200, {
+            'Content-Length': contentLength,
+            'Content-Type': contentType,
+            'Accept-Ranges': acceptRanges,
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'X-Content-Type-Options': 'nosniff'
+          });
+
+          // Streamer la vidéo directement
+          const reader = videoResponse.body.getReader();
+          const pump = async () => {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                res.write(Buffer.from(value));
+              }
+              res.end();
+            } catch (error) {
+              console.error('Streaming error:', error);
+              if (!res.headersSent) {
+                res.status(500).json({ error: 'Erreur de streaming' });
+              } else {
+                res.end();
+              }
+            }
+          };
+
+          pump();
+          return;
+        }
+
+      } catch (authError) {
+        if (authError.message === 'Token manquant' || authError.message === 'Token invalide') {
+          return res.status(401).json({ error: 'Token d\'authentification invalide' });
+        }
+        console.error('Stream error:', authError);
+        return res.status(500).json({ error: 'Erreur serveur' });
+      }
+    }
+    
     else {
       res.status(404).json({ error: 'Route non trouvée' });
     }

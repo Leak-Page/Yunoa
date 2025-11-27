@@ -27,7 +27,7 @@ interface VideoLoadOptions {
 
 export class VideoSecurityManager {
   private config: VideoSecurityConfig;
-  private blobCache = new Map<string, string>();
+  private urlCache = new Map<string, string>(); // Cache des URLs de streaming (pas de blobs)
 
   constructor(config: VideoSecurityConfig = {}) {
     this.config = {
@@ -39,8 +39,9 @@ export class VideoSecurityManager {
   }
 
   /**
-   * Charge une vidéo via le système de micro-chunks sécurisé
-   * Empêche le téléchargement par extensions grâce à la validation continue
+   * Charge une vidéo via streaming direct sécurisé (comme Netflix)
+   * Utilise une URL directe avec authentification via token
+   * Pas de blob - chargement direct avec support Range requests
    */
   async loadSecureVideo(options: VideoLoadOptions): Promise<string> {
     const { videoUrl, videoId, sessionToken, onProgress, signal } = options;
@@ -49,81 +50,50 @@ export class VideoSecurityManager {
     const cacheKey = `${videoId}-${this.hashString(videoUrl)}`;
     
     // Vérifier le cache
-    if (this.blobCache.has(cacheKey)) {
-      return this.blobCache.get(cacheKey)!;
+    if (this.urlCache.has(cacheKey)) {
+      return this.urlCache.get(cacheKey)!;
     }
 
-    let lastError: Error | null = null;
+    // Générer l'URL de streaming direct avec authentification
+    // Le token est passé en query parameter pour l'authentification
+    // Le serveur valide le token et stream la vidéo directement
+    const streamUrl = `/api/videos/stream/${videoId}?token=${encodeURIComponent(sessionToken)}`;
+    
+    // Mettre en cache l'URL (pas de blob)
+    this.urlCache.set(cacheKey, streamUrl);
 
-    for (let attempt = 0; attempt < this.config.maxRetries!; attempt++) {
-      try {
-        if (signal?.aborted) {
-          throw new DOMException('Chargement annulé', 'AbortError');
-        }
+    // Log sécurisé
+    console.log('✅ URL de streaming direct générée (sécurisé comme Netflix)');
 
-        // Utiliser le système de micro-chunks avec validation continue
-        // Note: videoElement sera passé depuis VideoPlayerComponent si disponible
-        const loader = new SecureChunkLoader({
-          videoUrl,
-          videoId,
-          sessionToken,
-          onProgress: (loaded, total) => {
-            if (onProgress && total > 0) {
-              onProgress((loaded / total) * 100);
-            }
-          },
-          onChunkValidated: (index) => {
-            console.log(`🔒 Chunk ${index} validé`);
-          },
-          signal
-        });
-
-        const blobUrl = await loader.load();
-
-        // Mettre en cache
-        this.blobCache.set(cacheKey, blobUrl);
-
-        // Log sécurisé sans exposer d'informations sensibles
-        console.log('✅ Vidéo chargée avec validation continue');
-
-        return blobUrl;
-
-      } catch (error) {
-        lastError = error as Error;
-        console.error(`Tentative ${attempt + 1} échouée:`, error.message);
-
-        if (attempt < this.config.maxRetries! - 1) {
-          await new Promise(resolve => setTimeout(resolve, this.config.retryDelay! * (attempt + 1)));
-        }
-      }
+    // Si onProgress est fourni, simuler la progression (le navigateur gère le streaming)
+    if (onProgress) {
+      // La progression sera gérée par le navigateur via les événements vidéo
+      // On peut déclencher un événement initial
+      setTimeout(() => {
+        onProgress(0);
+      }, 100);
     }
 
-    throw lastError || new Error('Échec du chargement après plusieurs tentatives');
+    return streamUrl;
   }
 
   /**
-   * Libère les ressources blob du cache
-   * SÉCURITÉ : Révoque tous les blob URLs pour empêcher le téléchargement
+   * Libère les ressources du cache
+   * Note: Plus besoin de révoquer des blobs car on utilise des URLs directes
    */
   cleanup(): void {
-    for (const blobUrl of this.blobCache.values()) {
-      // SÉCURITÉ : Révoquer immédiatement les blob URLs
-      // Empêche l'accès aux données après la lecture
-      URL.revokeObjectURL(blobUrl);
-    }
-    this.blobCache.clear();
-    console.log('[VideoSecurityManager] 🧹 Tous les blobs révoqués - sécurité maximale');
+    this.urlCache.clear();
+    console.log('[VideoSecurityManager] 🧹 Cache des URLs nettoyé');
   }
 
   /**
-   * Libère une ressource blob spécifique
+   * Libère une URL spécifique du cache
    */
-  releaseBlobUrl(blobUrl: string): void {
-    URL.revokeObjectURL(blobUrl);
+  releaseUrl(url: string): void {
     // Retirer du cache
-    for (const [key, url] of this.blobCache.entries()) {
-      if (url === blobUrl) {
-        this.blobCache.delete(key);
+    for (const [key, cachedUrl] of this.urlCache.entries()) {
+      if (cachedUrl === url) {
+        this.urlCache.delete(key);
         break;
       }
     }
