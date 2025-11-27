@@ -191,42 +191,85 @@ export default async (req, res) => {
           return res.status(403).json({ error: 'Accès refusé' });
         }
 
-        // SÉCURITÉ : Vérifier le Referer pour s'assurer que la requête vient du site
-        const referer = req.headers.referer || req.headers.origin || '';
-        if (!referer.includes(req.headers.host)) {
-          logSuspiciousActivity('SUSPICIOUS_REFERER', { 
+        // SÉCURITÉ : Vérifier strictement le Referer/Origin - BLOQUER si pas du site
+        const referer = req.headers.referer || '';
+        const origin = req.headers.origin || '';
+        const host = req.headers.host || '';
+        
+        // Vérifier que la requête vient bien du site
+        const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
+        const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
+        
+        if (!isValidReferer && !isValidOrigin) {
+          logSuspiciousActivity('INVALID_REFERER_ORIGIN', { 
             userId, 
             videoId, 
             referer,
-            ip: getClientIp(req)
+            origin,
+            ip: getClientIp(req),
+            userAgent
           });
-          // Ne pas bloquer complètement, mais logger
+          return res.status(403).json({ error: 'Accès refusé - Requête non autorisée' });
         }
 
         // SÉCURITÉ : Limiter le nombre de requêtes par IP pour détecter les téléchargements
         const clientIp = getClientIp(req);
         const now = Date.now();
         const trackerKey = `${clientIp}_${videoId}`;
-        const tracker = requestTracker.get(trackerKey) || { count: 0, lastRequest: 0, videoId };
+        const tracker = requestTracker.get(trackerKey) || { count: 0, lastRequest: 0, videoId, ranges: [] };
         
         // Réinitialiser le compteur si plus de 1 minute depuis la dernière requête
         if (now - tracker.lastRequest > 60000) {
           tracker.count = 0;
+          tracker.ranges = [];
         }
         
         tracker.count++;
         tracker.lastRequest = now;
+        
+        // SÉCURITÉ : Détecter les patterns de téléchargement (requêtes séquentielles)
+        if (rangeHeader) {
+          const rangeMatch = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+          if (rangeMatch) {
+            const start = parseInt(rangeMatch[1]);
+            tracker.ranges.push({ start, time: now });
+            
+            // Détecter si on télécharge séquentiellement (pattern de téléchargement)
+            if (tracker.ranges.length > 5) {
+              const recentRanges = tracker.ranges.slice(-10);
+              let sequentialCount = 0;
+              for (let i = 1; i < recentRanges.length; i++) {
+                if (recentRanges[i].start > recentRanges[i-1].start) {
+                  sequentialCount++;
+                }
+              }
+              
+              // Si plus de 80% des requêtes sont séquentielles, c'est probablement un téléchargement
+              if (sequentialCount / recentRanges.length > 0.8) {
+                logSuspiciousActivity('DOWNLOAD_PATTERN_DETECTED', { 
+                  userId, 
+                  videoId, 
+                  sequentialCount,
+                  totalRanges: recentRanges.length,
+                  ip: clientIp
+                });
+                return res.status(403).json({ error: 'Accès refusé - Pattern de téléchargement détecté' });
+              }
+            }
+          }
+        }
+        
         requestTracker.set(trackerKey, tracker);
         
-        // Bloquer si trop de requêtes (plus de 100 requêtes par minute = téléchargement)
-        if (tracker.count > 100) {
+        // Bloquer si trop de requêtes (plus de 50 requêtes par minute = téléchargement)
+        if (tracker.count > 50) {
           logSuspiciousActivity('EXCESSIVE_REQUESTS', { 
             userId, 
             videoId, 
             count: tracker.count,
             ip: clientIp
           });
-          return res.status(429).json({ error: 'Trop de requêtes' });
+          return res.status(429).json({ error: 'Trop de requêtes - Accès temporairement bloqué' });
         }
 
         // SÉCURITÉ : Vérifier et valider le Range header
@@ -253,8 +296,8 @@ export default async (req, res) => {
               return res.status(416).json({ error: 'Range Not Satisfiable' });
             }
             
-            // Limiter à 20MB par requête maximum pour le streaming
-            const maxChunkSize = 20 * 1024 * 1024;
+            // SÉCURITÉ : Limiter à 5MB par requête maximum pour empêcher le téléchargement complet
+            const maxChunkSize = 5 * 1024 * 1024; // 5MB max par requête
             if (end === null) {
               // Pas de fin spécifiée, limiter à maxChunkSize
               const actualEnd = videoSize > 0 
@@ -262,8 +305,25 @@ export default async (req, res) => {
                 : start + maxChunkSize - 1;
               range = `bytes=${start}-${actualEnd}`;
             } else if ((end - start) > maxChunkSize) {
-              // Range trop grand, limiter
+              // Range trop grand, limiter strictement
               range = `bytes=${start}-${start + maxChunkSize - 1}`;
+            }
+            
+            // SÉCURITÉ : Empêcher les requêtes qui couvrent plus de 10% de la vidéo
+            if (videoSize > 0) {
+              const requestedSize = (end !== null ? end : start + maxChunkSize) - start;
+              const percentage = (requestedSize / videoSize) * 100;
+              if (percentage > 10) {
+                logSuspiciousActivity('LARGE_RANGE_REQUEST', { 
+                  userId, 
+                  videoId, 
+                  percentage: percentage.toFixed(2),
+                  requestedSize,
+                  videoSize,
+                  ip: clientIp
+                });
+                return res.status(403).json({ error: 'Range request trop large - Accès refusé' });
+              }
             }
           }
         } else {
@@ -287,14 +347,16 @@ export default async (req, res) => {
           'Content-Type': videoResponse.headers.get('content-type') || 'video/mp4',
           'Content-Length': videoResponse.headers.get('content-length') || '',
           'Accept-Ranges': 'bytes',
-          'Cache-Control': 'no-cache, no-store, must-revalidate, private',
+          'Cache-Control': 'no-cache, no-store, must-revalidate, private, max-age=0',
           'Pragma': 'no-cache',
           'Expires': '0',
           'X-Content-Type-Options': 'nosniff',
           'X-Frame-Options': 'DENY',
           'Content-Disposition': 'inline; filename="stream.mp4"', // inline empêche le téléchargement
           'X-Robots-Tag': 'noindex, nofollow', // Empêcher l'indexation
-          'Cross-Origin-Resource-Policy': 'same-origin' // Empêcher l'accès cross-origin
+          'Cross-Origin-Resource-Policy': 'same-origin', // Empêcher l'accès cross-origin
+          'X-Permitted-Cross-Domain-Policies': 'none', // Empêcher l'accès cross-domain
+          'Referrer-Policy': 'same-origin' // Limiter les informations de referrer
         };
 
         if (videoResponse.status === 206) {
