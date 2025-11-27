@@ -188,13 +188,36 @@ export class StreamingMSELoader {
     // Démarrer le chargement
     loadAllSegments();
     
-    // Attendre que la vidéo démarre (maximum 3 secondes)
+    // Attendre que la vidéo démarre (maximum 5 secondes)
     const startTime = Date.now();
-    while (!videoStarted && Date.now() - startTime < 3000) {
+    while (!videoStarted && Date.now() - startTime < 5000) {
       await new Promise(resolve => setTimeout(resolve, 50));
     }
     
-    return currentBlobUrl || '';
+    if (!videoStarted && this.segmentCache.size > 0) {
+      // Forcer le démarrage même si on n'a pas atteint le minimum
+      const segments: ArrayBuffer[] = [];
+      for (let i = 0; i < this.totalChunks; i++) {
+        const segment = this.segmentCache.get(i);
+        if (segment) segments.push(segment);
+        else break;
+      }
+      
+      if (segments.length > 0) {
+        const blob = new Blob(segments, { type: 'video/mp4' });
+        currentBlobUrl = URL.createObjectURL(blob);
+        videoElement.src = currentBlobUrl;
+        videoElement.load();
+        videoStarted = true;
+        console.log(`[StreamingMSE] 🎬 Vidéo forcée (${segments.length}/${this.totalChunks} segments)`);
+      }
+    }
+    
+    if (!currentBlobUrl) {
+      throw new Error('Impossible de créer le blob vidéo - aucun segment chargé');
+    }
+    
+    return currentBlobUrl;
   }
 
   /**
@@ -353,35 +376,61 @@ export class StreamingMSELoader {
     if (this.sessionId) request.sessionId = this.sessionId;
     if (chunkIndex > 0 && this.lastHash) request.previousHash = this.lastHash;
 
-    const response = await fetch(`/api/videos/secure-stream/chunk`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.currentToken}`,
-        'X-Chunk-Index': chunkIndex.toString(),
-        'X-Total-Chunks': this.totalChunks.toString(),
-        'X-Chunk-Size': this.chunkSize.toString()
-      },
-      body: JSON.stringify(request),
-      signal: this.options.signal
-    });
+    try {
+      const response = await fetch(`/api/videos/secure-stream/chunk`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.currentToken}`,
+          'X-Chunk-Index': chunkIndex.toString(),
+          'X-Total-Chunks': this.totalChunks.toString(),
+          'X-Chunk-Size': this.chunkSize.toString()
+        },
+        body: JSON.stringify(request),
+        signal: this.options.signal
+      });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Erreur segment ${chunkIndex}: ${response.status} - ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = `Erreur segment ${chunkIndex}: ${response.status}`;
+        
+        try {
+          const errorJson = JSON.parse(errorText);
+          if (errorJson.error) {
+            errorMessage += ` - ${errorJson.error}`;
+          }
+          if (errorJson.reason) {
+            errorMessage += ` (${errorJson.reason})`;
+          }
+        } catch {
+          errorMessage += ` - ${errorText}`;
+        }
+        
+        throw new Error(errorMessage);
+      }
+
+      const nextToken = response.headers.get('X-Next-Token');
+      const nextHash = response.headers.get('X-Next-Hash');
+      const expiresAt = parseInt(response.headers.get('X-Expires-At') || '0');
+
+      if (!nextToken || !nextHash) {
+        throw new Error('Réponse invalide du serveur - headers manquants');
+      }
+
+      const data = await response.arrayBuffer();
+      
+      if (!data || data.byteLength === 0) {
+        throw new Error(`Segment ${chunkIndex} vide reçu du serveur`);
+      }
+
+      return { data, nextToken, nextHash, expiresAt };
+    } catch (error) {
+      // Améliorer les messages d'erreur
+      if (error instanceof TypeError && error.message.includes('fetch')) {
+        throw new Error(`Erreur réseau lors du chargement du segment ${chunkIndex}`);
+      }
+      throw error;
     }
-
-    const nextToken = response.headers.get('X-Next-Token');
-    const nextHash = response.headers.get('X-Next-Hash');
-    const expiresAt = parseInt(response.headers.get('X-Expires-At') || '0');
-
-    if (!nextToken || !nextHash) {
-      throw new Error('Réponse invalide du serveur');
-    }
-
-    const data = await response.arrayBuffer();
-
-    return { data, nextToken, nextHash, expiresAt };
   }
 
   private updateProgress(): void {

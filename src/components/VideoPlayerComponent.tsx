@@ -604,21 +604,42 @@ const VideoPlayerComponent = () => {
         const error = videoElement.error
         if (error) {
           let errorMessage = "Erreur de lecture vidéo"
+          let errorDetails = ""
+          
           switch (error.code) {
             case error.MEDIA_ERR_NETWORK:
               errorMessage = "Erreur de réseau lors du chargement"
+              errorDetails = "Vérifiez votre connexion internet et réessayez"
               break
             case error.MEDIA_ERR_DECODE:
               errorMessage = "Erreur de décodage vidéo"
+              errorDetails = "Le format vidéo n'est pas compatible avec votre navigateur. Le fichier peut nécessiter un ré-encodage en H.264 (AVC) + AAC."
+              console.error("[VideoPlayer] ❌ Erreur de décodage - Le codec vidéo n'est pas supporté par le navigateur")
+              console.error("[VideoPlayer] 💡 Solution: Ré-encoder la vidéo en H.264 (AVC) + AAC, conteneur MP4")
               break
             case error.MEDIA_ERR_SRC_NOT_SUPPORTED:
               errorMessage = "Format vidéo non supporté"
+              errorDetails = "Votre navigateur ne supporte pas ce format vidéo"
               break
             case error.MEDIA_ERR_ABORTED:
               errorMessage = "Chargement interrompu"
+              errorDetails = "Le chargement a été interrompu"
               break
+            default:
+              errorMessage = "Erreur inconnue lors de la lecture"
+              errorDetails = `Code d'erreur: ${error.code}`
           }
-          setError(errorMessage)
+          
+          // Afficher un message d'erreur détaillé
+          setError(`${errorMessage}${errorDetails ? ` - ${errorDetails}` : ''}`)
+          
+          // Logger les détails pour le débogage
+          console.error("[VideoPlayer] Erreur vidéo complète:", {
+            code: error.code,
+            message: errorMessage,
+            details: errorDetails,
+            src: videoElement.src?.substring(0, 100) // Limiter la longueur
+          })
         }
         setIsBuffering(false)
       }
@@ -626,6 +647,19 @@ const VideoPlayerComponent = () => {
       const handleVideoLoad = async () => {
         setIsBuffering(false)
         setError(null)
+
+        // Vérifier que la vidéo est valide
+        if (videoElement.readyState < 2) {
+          console.warn("[VideoPlayer] ⚠️ Vidéo pas encore prête (readyState:", videoElement.readyState, ")");
+          return;
+        }
+
+        // Vérifier la durée de la vidéo
+        if (isNaN(videoElement.duration) || videoElement.duration === 0) {
+          console.error("[VideoPlayer] ❌ Durée vidéo invalide - possible problème de codec");
+          setError("Erreur de décodage vidéo - Le format vidéo n'est pas compatible. Le fichier peut nécessiter un ré-encodage en H.264 (AVC) + AAC.");
+          return;
+        }
 
         // Resume from saved progress if available
         if (resumeData && resumeData.progress > 0 && resumeData.progress < 0.9) {
@@ -644,6 +678,14 @@ const VideoPlayerComponent = () => {
 
       const handleCanPlay = async () => {
         setIsBuffering(false)
+        setError(null)
+
+        // Vérifier que la vidéo est vraiment prête
+        if (isNaN(videoElement.duration) || videoElement.duration === 0) {
+          console.error("[VideoPlayer] ❌ Durée vidéo invalide dans canplay - possible problème de codec");
+          setError("Erreur de décodage vidéo - Le format vidéo n'est pas compatible. Le fichier peut nécessiter un ré-encodage en H.264 (AVC) + AAC.");
+          return;
+        }
 
         if (!isPlaying && !videoElement.paused === false) {
           try {
@@ -687,14 +729,23 @@ const VideoPlayerComponent = () => {
 
         const blobUrl = await loader.load();
         
-        // Si ce n'est pas déjà fait par MSE, définir la source
-        if (!videoElement.src || !videoElement.src.startsWith('blob:')) {
-          videoElement.src = blobUrl;
-          await videoElement.load();
+        if (!blobUrl) {
+          throw new Error('Aucune URL blob générée');
         }
         
-        console.log('[VideoPlayer] ✅ Streaming démarré avec succès');
-        setIsBuffering(false);
+        // Vérifier que le blob est valide avant de l'assigner
+        if (blobUrl && blobUrl.startsWith('blob:')) {
+          // Si ce n'est pas déjà fait par MSE, définir la source
+          if (!videoElement.src || !videoElement.src.startsWith('blob:')) {
+            videoElement.src = blobUrl;
+            await videoElement.load();
+          }
+          
+          console.log('[VideoPlayer] ✅ Streaming démarré avec succès');
+          setIsBuffering(false);
+        } else {
+          throw new Error('URL blob invalide générée');
+        }
         
       } catch (error) {
         console.error('[VideoPlayer] ❌ Erreur streaming vidéo:', error);
