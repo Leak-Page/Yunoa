@@ -678,9 +678,10 @@ const VideoPlayerComponent = () => {
           videoId,
           sessionToken: token,
           videoElement, // Passer l'élément vidéo pour activer le streaming MSE
-          onProgress: (progress) => {
-            setBuffered(progress);
-            console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progress)}%`);
+          onProgress: (loaded, total) => {
+            const progressPercent = total > 0 ? (loaded / total) * 100 : 0;
+            setBuffered(progressPercent);
+            console.log(`[VideoPlayer] 📊 Progression: ${Math.round(progressPercent)}%`);
           }
         });
 

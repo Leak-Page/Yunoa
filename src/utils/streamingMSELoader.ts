@@ -93,20 +93,34 @@ export class StreamingMSELoader {
     const blobParts: BlobPart[] = [];
     let blobUrl: string | null = null;
     let isVideoReady = false;
-    const INITIAL_CHUNKS = 20; // Charger 20 segments (20 MB) avant de démarrer pour un très bon buffer
+    // Charger au moins 30 segments ou 50% de la vidéo avant de démarrer
+    const MIN_CHUNKS_TO_START = Math.min(30, Math.ceil(this.totalChunks * 0.5));
     let lastUpdateChunkCount = 0;
+    
+    // Fonction pour calculer la taille réelle chargée
+    const getLoadedSize = () => {
+      return blobParts.reduce((sum, part) => {
+        if (part instanceof ArrayBuffer) return sum + part.byteLength;
+        if (part instanceof Uint8Array) return sum + part.byteLength;
+        return sum;
+      }, 0);
+    };
     
     // Fonction pour créer le blob initial
     const createInitialBlob = () => {
       if (blobParts.length === 0 || isVideoReady) return;
       
-      if (blobParts.length >= INITIAL_CHUNKS) {
+      const loadedSize = getLoadedSize();
+      const loadedPercent = (loadedSize / this.totalSize) * 100;
+      
+      // Démarrer quand on a assez de segments OU 50% de la vidéo
+      if (blobParts.length >= MIN_CHUNKS_TO_START || loadedPercent >= 50) {
         const blob = new Blob(blobParts, { type: 'video/mp4' });
         blobUrl = URL.createObjectURL(blob);
         this.options.videoElement.src = blobUrl;
         this.options.videoElement.load();
         isVideoReady = true;
-        console.log(`[StreamingMSE] 🎬 Vidéo prête avec ${blobParts.length} segments (${Math.round(blobParts.length * this.chunkSize / 1024 / 1024)} MB)`);
+        console.log(`[StreamingMSE] 🎬 Vidéo prête avec ${blobParts.length}/${this.totalChunks} segments (${Math.round(loadedSize / 1024 / 1024)} MB, ${Math.round(loadedPercent)}%)`);
       }
     };
     
@@ -192,8 +206,13 @@ export class StreamingMSELoader {
 
           // Mettre à jour la progression
           if (this.options.onProgress) {
-            const loaded = blobParts.length * this.chunkSize;
-            this.options.onProgress(Math.min(loaded, this.totalSize), this.totalSize);
+            const loadedBytes = blobParts.reduce((sum, part) => {
+              if (part instanceof ArrayBuffer) return sum + part.byteLength;
+              if (part instanceof Uint8Array) return sum + part.byteLength;
+              return sum;
+            }, 0);
+            // onProgress attend (loaded, total) - on passe les bytes
+            this.options.onProgress(Math.min(loadedBytes, this.totalSize), this.totalSize);
           }
 
           // Réinitialiser le compteur d'erreurs consécutives en cas de succès
@@ -201,13 +220,20 @@ export class StreamingMSELoader {
           segmentLoaded = true;
 
           // Créer le blob initial une seule fois quand on a assez de segments
-          if (!isVideoReady && blobParts.length >= INITIAL_CHUNKS) {
-            createInitialBlob();
-            lastUpdateChunkCount = blobParts.length;
+          if (!isVideoReady) {
+            const loadedSize = getLoadedSize();
+            const loadedPercent = (loadedSize / this.totalSize) * 100;
+            
+            // Démarrer quand on a assez de segments OU 50% de la vidéo chargée
+            if (blobParts.length >= MIN_CHUNKS_TO_START || loadedPercent >= 50) {
+              createInitialBlob();
+              lastUpdateChunkCount = blobParts.length;
+            }
           }
           
           // Si la vidéo est en cours de lecture, vérifier si on doit mettre à jour le blob
-          if (isVideoReady) {
+          // IMPORTANT: Ne mettre à jour que si vraiment nécessaire pour éviter les interruptions
+          if (isVideoReady && blobParts.length > lastUpdateChunkCount) {
             const videoElement = this.options.videoElement;
             const bufferedEnd = videoElement.buffered.length > 0 
               ? videoElement.buffered.end(videoElement.buffered.length - 1) 
@@ -218,12 +244,13 @@ export class StreamingMSELoader {
             const timeRemaining = duration > 0 ? duration - currentTime : Infinity;
             
             // Mettre à jour seulement si :
-            // 1. On a chargé au moins 10 nouveaux segments depuis la dernière mise à jour
-            // 2. ET on est proche de la fin du buffer actuel (< 5 secondes)
-            // 3. ET il reste encore de la vidéo à charger
-            if (blobParts.length - lastUpdateChunkCount >= 10 && 
-                bufferAhead < 5 && 
+            // 1. On a chargé au moins 15 nouveaux segments depuis la dernière mise à jour
+            // 2. ET on est très proche de la fin du buffer actuel (< 3 secondes)
+            // 3. ET il reste encore de la vidéo à charger (> 10 secondes)
+            if (blobParts.length - lastUpdateChunkCount >= 15 && 
+                bufferAhead < 3 && 
                 timeRemaining > 10) {
+              console.log(`[StreamingMSE] ⚠️ Buffer faible (${bufferAhead.toFixed(1)}s), mise à jour du blob...`);
               updateBlobWithMoreSegments();
               lastUpdateChunkCount = blobParts.length;
             }
