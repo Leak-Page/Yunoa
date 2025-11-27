@@ -106,6 +106,100 @@ export default async (req, res) => {
   const pathParts = pathname.split('/').filter(part => part);
 
   try {
+    // POST /api/videos/stream-url - Obtenir une URL signée pour le streaming direct
+    if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream-url' && req.method === 'POST') {
+      const user = authenticateToken(req);
+      const { videoId } = req.body;
+
+      if (!videoId) {
+        return res.status(400).json({ error: 'ID de vidéo requis' });
+      }
+
+      // Récupérer les infos de la vidéo
+      const { data: video, error: videoError } = await supabase
+        .from('videos')
+        .select('video_url, title')
+        .eq('id', videoId)
+        .single();
+
+      if (videoError || !video || !video.video_url) {
+        return res.status(404).json({ error: 'Vidéo non trouvée' });
+      }
+
+      // Générer un token signé pour l'URL (valide 1 heure)
+      const token = jwt.sign(
+        {
+          userId: user.id,
+          videoId: videoId,
+          url: video.video_url,
+          exp: Math.floor(Date.now() / 1000) + 3600 // 1 heure
+        },
+        JWT_SECRET
+      );
+
+      // Créer une URL signée (proxy interne)
+      const signedUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/stream?token=${encodeURIComponent(token)}`;
+
+      return res.json({
+        signedUrl,
+        expiresIn: 3600
+      });
+    }
+
+    // GET /api/videos/stream - Proxy pour le streaming avec token signé
+    else if (pathParts.length === 3 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'stream' && req.method === 'GET') {
+      const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
+      const token = searchParams.get('token');
+
+      if (!token) {
+        return res.status(401).json({ error: 'Token manquant' });
+      }
+
+      try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const videoUrl = decoded.url;
+
+        // Récupérer le Range header pour le streaming
+        const range = req.headers.range;
+        
+        // Faire une requête proxy vers la vidéo
+        const videoResponse = await fetch(videoUrl, {
+          headers: range ? { 'Range': range } : {}
+        });
+
+        if (!videoResponse.ok && videoResponse.status !== 206) {
+          return res.status(videoResponse.status).json({ error: 'Erreur de récupération vidéo' });
+        }
+
+        // Copier les headers de la réponse
+        const headers = {
+          'Content-Type': videoResponse.headers.get('content-type') || 'video/mp4',
+          'Content-Length': videoResponse.headers.get('content-length') || '',
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0'
+        };
+
+        if (videoResponse.status === 206) {
+          headers['Content-Range'] = videoResponse.headers.get('content-range') || '';
+        }
+
+        Object.entries(headers).forEach(([key, value]) => {
+          if (value) res.setHeader(key, value);
+        });
+
+        res.status(videoResponse.status);
+
+        // Streamer la réponse
+        const buffer = await videoResponse.arrayBuffer();
+        return res.end(Buffer.from(buffer));
+
+      } catch (error) {
+        return res.status(401).json({ error: 'Token invalide ou expiré' });
+      }
+    }
+
     // GET /api/videos/drm/key - Système de clés DRM sécurisé
     if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'drm' && pathParts[3] === 'key' && req.method === 'GET') {
       const { searchParams } = new URL(req.url, `http://${req.headers.host}`);

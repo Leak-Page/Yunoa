@@ -47,44 +47,34 @@ export class SecureChunkLoader {
   }
 
   /**
-   * Charge la vidéo en streaming progressif avec MSE (nouveau système optimisé)
+   * Charge la vidéo en streaming optimisé et obfusqué
    */
   async load(): Promise<string> {
-    // Générer l'empreinte du client
-    this.fingerprint = await clientFingerprint.generate();
-
-    if (!this.fingerprint) {
-      throw new Error('Impossible de générer l\'empreinte du client');
-    }
-
-    // TOUJOURS utiliser MSE si disponible pour la sécurité maximale et les performances
-    if (this.options.videoElement && window.MediaSource) {
-      console.log('[SecureChunkLoader] 🚀 Utilisation du nouveau système de streaming MSE optimisé');
-      
-      // Utiliser le nouveau StreamingMSELoader
-      this.mseLoader = new StreamingMSELoader({
-        videoUrl: this.options.videoUrl,
-        videoId: this.options.videoId,
-        sessionToken: this.currentToken,
-        videoElement: this.options.videoElement,
-        chunkSize: this.chunkSize,
-        onProgress: (loaded, total) => {
-          if (this.options.onProgress) {
-            this.options.onProgress(loaded, total);
-          }
-        },
-        onError: (error) => {
-          console.error('[SecureChunkLoader] ❌ Erreur:', error);
-        },
-        signal: this.options.signal
-      });
-
-      return await this.mseLoader.load();
-    }
+    // Utiliser le nouveau système de chargement obfusqué et optimisé
+    const { ObfuscatedStreamLoader } = await import('@/utils/obfuscatedStreamLoader');
     
-    // Fallback sécurisé uniquement si MSE n'est vraiment pas disponible
-    console.warn('[SecureChunkLoader] ⚠️ MSE non disponible, utilisation du fallback sécurisé');
-    throw new Error('Media Source Extensions requis pour la sécurité - veuillez utiliser un navigateur moderne');
+    console.log('[SecureChunkLoader] 🚀 Utilisation du système de streaming obfusqué optimisé');
+    
+    const obfuscatedLoader = new ObfuscatedStreamLoader({
+      videoUrl: this.options.videoUrl,
+      videoId: this.options.videoId,
+      sessionToken: this.currentToken,
+      videoElement: this.options.videoElement,
+      onProgress: (loaded, total) => {
+        if (this.options.onProgress) {
+          this.options.onProgress(loaded, total);
+        }
+      },
+      onError: (error) => {
+        console.error('[SecureChunkLoader] ❌ Erreur:', error);
+      },
+      signal: this.options.signal
+    });
+
+    // Stocker le loader pour le cleanup
+    (this as any).obfuscatedLoader = obfuscatedLoader;
+
+    return await obfuscatedLoader.load();
   }
 
 
@@ -180,6 +170,10 @@ export class SecureChunkLoader {
     if (this.mseLoader) {
       this.mseLoader.abort();
     }
+    
+    if ((this as any).obfuscatedLoader) {
+      (this as any).obfuscatedLoader.abort();
+    }
   }
 
   /**
@@ -196,6 +190,11 @@ export class SecureChunkLoader {
     if (this.mseLoader) {
       this.mseLoader.cleanup();
       this.mseLoader = null;
+    }
+    
+    if ((this as any).obfuscatedLoader) {
+      (this as any).obfuscatedLoader.cleanup();
+      (this as any).obfuscatedLoader = null;
     }
     
     console.log('[SecureChunkLoader] 🧹 Tous les chunks nettoyés - sécurité maximale');
