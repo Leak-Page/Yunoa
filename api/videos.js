@@ -778,7 +778,7 @@ export default async (req, res) => {
 
        return res.end(Buffer.from(chunkData));
     }
-
+    
     // ========== ROUTES HLS ==========
     // POST /api/videos/hls/playlist - Générer une playlist HLS avec token
     else if (pathParts.length === 4 && pathParts[0] === 'api' && pathParts[1] === 'videos' && pathParts[2] === 'hls' && pathParts[3] === 'playlist' && req.method === 'POST') {
@@ -946,7 +946,7 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
       const token = searchParams.get('token');
       const segmentIndex = parseInt(searchParams.get('index') || '0');
-
+      
       if (!token) {
         return res.status(401).json({ error: 'Token manquant' });
       }
@@ -1041,11 +1041,11 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       }
 
       // Récupérer les infos de la vidéo
-      const { data: video, error: videoError } = await supabase
-        .from('videos')
+        const { data: video, error: videoError } = await supabase
+          .from('videos')
         .select('video_url, title, duration, id')
-        .eq('id', videoId)
-        .single();
+          .eq('id', videoId)
+          .single();
 
       if (videoError || !video || !video.video_url) {
         return res.status(404).json({ error: 'Vidéo non trouvée' });
@@ -1110,8 +1110,8 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       const suspiciousAgents = ['Video DownloadHelper', 'youtube-dl', 'wget', 'curl', 'aria2', 'ffmpeg', 'VLC'];
       if (suspiciousAgents.some(agent => userAgent.toLowerCase().includes(agent.toLowerCase()))) {
         logSuspiciousActivity('SUSPICIOUS_USER_AGENT_CHUNK', { 
-          userId: user.id, 
-          videoId, 
+                userId: user.id,
+                videoId,
           userAgent,
           ip: getClientIp(req)
         });
@@ -1138,10 +1138,10 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       try {
         // Faire une requête Range vers la vidéo
         const videoResponse = await fetch(video.video_url, {
-          headers: {
-            'Range': `bytes=${start}-${end}`
-          }
-        });
+            headers: {
+              'Range': `bytes=${start}-${end}`
+            }
+          });
 
         if (!videoResponse.ok && videoResponse.status !== 206) {
           return res.status(videoResponse.status).json({ error: 'Erreur de récupération chunk' });

@@ -58,10 +58,20 @@ export class CustomStreamLoader {
       await this.fetchMetadata();
 
       // Étape 2: Initialiser MediaSource
-      await this.initializeMediaSource();
+      try {
+        await this.initializeMediaSource();
+      } catch (mseError) {
+        console.warn('[CustomStream] ⚠️ MediaSource non disponible, utilisation du fallback');
+        throw new Error('MediaSource non supporté');
+      }
 
       // Étape 3: Charger les chunks initiaux
-      await this.loadInitialChunks();
+      try {
+        await this.loadInitialChunks();
+      } catch (chunkError) {
+        console.warn('[CustomStream] ⚠️ Erreur lors du chargement des chunks, MediaSource ne peut pas utiliser des MP4 bruts');
+        throw new Error('Chunks MP4 bruts non compatibles avec MediaSource');
+      }
 
       // Étape 4: Démarrer le chargement progressif
       this.startProgressiveLoading();
@@ -69,7 +79,9 @@ export class CustomStreamLoader {
       return 'blob:custom-stream';
     } catch (error) {
       console.error('[CustomStream] ❌ Erreur:', error);
-      this.options.onError?.(error as Error);
+      // Nettoyer MediaSource si initialisé
+      this.cleanup();
+      // Propager l'erreur pour que SecureChunkLoader utilise le fallback
       throw error;
     }
   }
@@ -135,10 +147,12 @@ export class CustomStreamLoader {
               console.log('[CustomStream] 📝 SourceBuffer mis à jour');
             });
 
-            this.sourceBuffer.addEventListener('error', (e) => {
-              console.error('[CustomStream] ❌ Erreur SourceBuffer:', e);
-              reject(new Error('Erreur SourceBuffer'));
-            });
+      this.sourceBuffer.addEventListener('error', (e) => {
+        console.error('[CustomStream] ❌ Erreur SourceBuffer:', e);
+        // MediaSource ne peut pas utiliser des chunks MP4 bruts
+        // Il faut des fragments MP4 (fMP4) préparés
+        reject(new Error('MediaSource ne peut pas utiliser des chunks MP4 bruts - nécessite des fragments MP4 (fMP4)'));
+      });
           } catch (error) {
             console.error('[CustomStream] ❌ Erreur lors de l\'ajout du SourceBuffer:', error);
             reject(error);
@@ -225,11 +239,17 @@ export class CustomStreamLoader {
       // Ajouter le chunk au SourceBuffer si c'est le prochain attendu
       if (index === this.currentChunkIndex) {
         console.log(`[CustomStream] ➕ Ajout du chunk ${index} au SourceBuffer...`);
-        await this.appendChunkToBuffer(chunk);
-        this.currentChunkIndex++;
-        
-        // Charger le chunk suivant
-        this.loadNextChunk();
+        try {
+          await this.appendChunkToBuffer(chunk);
+          this.currentChunkIndex++;
+          
+          // Charger le chunk suivant
+          this.loadNextChunk();
+        } catch (bufferError) {
+          // MediaSource ne peut pas utiliser des chunks MP4 bruts
+          console.error(`[CustomStream] ❌ Impossible d'ajouter le chunk ${index} au buffer:`, bufferError);
+          throw bufferError; // Propager l'erreur pour déclencher le fallback
+        }
       } else {
         console.log(`[CustomStream] ⏳ Chunk ${index} chargé mais pas encore ajouté (attendu: ${this.currentChunkIndex})`);
       }
@@ -315,7 +335,8 @@ export class CustomStreamLoader {
         
         this.sourceBuffer!.addEventListener('error', (e) => {
           console.error('[CustomStream] ❌ Erreur lors de l\'ajout au buffer:', e);
-          reject(new Error('Erreur appendBuffer'));
+          // MediaSource ne peut pas utiliser des chunks MP4 bruts
+          reject(new Error('MediaSource ne peut pas utiliser des chunks MP4 bruts - nécessite des fragments MP4 (fMP4)'));
         }, { once: true });
       } catch (error) {
         console.error('[CustomStream] ❌ Exception lors de appendBuffer:', error);

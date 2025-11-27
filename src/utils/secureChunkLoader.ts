@@ -39,7 +39,7 @@ export class SecureChunkLoader {
         sessionToken: this.currentToken,
         videoElement: this.options.videoElement!,
         onProgress: (loaded, total) => {
-          if (this.options.onProgress) {
+        if (this.options.onProgress) {
             this.options.onProgress(loaded, total);
           }
         },
@@ -54,7 +54,7 @@ export class SecureChunkLoader {
       (this as any).customLoader = customLoader;
 
       return await customLoader.load();
-    } catch (error) {
+      } catch (error) {
       console.warn('[SecureChunkLoader] ⚠️ Système custom non disponible, fallback:', error);
       
       // Fallback sur le système obfusqué
@@ -74,8 +74,8 @@ export class SecureChunkLoader {
           console.error('[SecureChunkLoader] ❌ Erreur:', error);
           this.options.onError?.(error);
         },
-        signal: this.options.signal
-      });
+      signal: this.options.signal
+    });
 
       return await this.obfuscatedLoader.load();
     }
