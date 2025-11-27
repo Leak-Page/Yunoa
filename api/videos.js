@@ -850,40 +850,36 @@ export default async (req, res) => {
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         
-        // Vérifier que le token contient sessionId
-        if (!decoded.sessionId) {
-          console.error('[HLS Playlist] Token sans sessionId');
-          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
-        }
-        
-        const session = secureStreams.get(decoded.sessionId);
-
-        if (!session) {
-          console.error('[HLS Playlist] Session non trouvée:', decoded.sessionId);
-          return res.status(401).json({ error: 'Session non trouvée' });
-        }
-        
-        if (session.type !== 'hls') {
-          console.error('[HLS Playlist] Type de session incorrect:', session.type);
-          return res.status(401).json({ error: 'Type de session incorrect' });
-        }
-        
-        if (Date.now() > session.expiresAt) {
-          console.error('[HLS Playlist] Session expirée');
-          return res.status(401).json({ error: 'Session expirée' });
+        // Vérifier que le token contient les informations nécessaires
+        if (!decoded.sessionId || !decoded.userId || !decoded.videoId) {
+          console.error('[HLS Playlist] Token incomplet');
+          return res.status(401).json({ error: 'Token invalide - informations manquantes' });
         }
 
-        // Vérifier le Referer/Origin
+        // Récupérer l'URL de la vidéo depuis la base de données (car les sessions ne persistent pas sur serverless)
+        const { data: video, error: videoError } = await supabase
+          .from('videos')
+          .select('video_url, id')
+          .eq('id', decoded.videoId)
+          .single();
+
+        if (videoError || !video || !video.video_url) {
+          console.error('[HLS Playlist] Vidéo non trouvée:', decoded.videoId);
+          return res.status(404).json({ error: 'Vidéo non trouvée' });
+        }
+
+        // Vérifier le Referer/Origin (assoupli pour les requêtes HLS)
         const referer = req.headers.referer || '';
         const origin = req.headers.origin || '';
         const host = req.headers.host || '';
         const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
         const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
         
+        // Ne bloquer que si un referer/origin est présent et invalide
         if ((referer || origin) && !isValidReferer && !isValidOrigin) {
           logSuspiciousActivity('INVALID_REFERER_HLS', { 
-            userId: session.userId, 
-            videoId: session.videoId,
+            userId: decoded.userId, 
+            videoId: decoded.videoId,
             referer,
             origin,
             ip: getClientIp(req)
@@ -894,29 +890,21 @@ export default async (req, res) => {
         // Générer la playlist HLS avec segments signés
         const baseUrl = `${req.protocol || 'https'}://${req.headers.host}/api/videos/hls`;
         
-        // Vérifier que decoded.sessionId existe
-        if (!decoded.sessionId) {
-          console.error('[HLS Playlist] decoded.sessionId manquant dans le token');
-          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
-        }
-        
         const segmentToken = jwt.sign(
           {
             sessionId: decoded.sessionId,
-            userId: session.userId,
-            videoId: session.videoId,
+            userId: decoded.userId,
+            videoId: decoded.videoId,
             iat: Math.floor(Date.now() / 1000),
             exp: Math.floor(Date.now() / 1000) + 300
           },
           JWT_SECRET
         );
-        
-        console.log('[HLS Playlist] Token de segment généré pour sessionId:', decoded.sessionId.substring(0, 16) + '...');
 
         // Obtenir la taille de la vidéo pour générer la playlist
         let videoSize = 0;
         try {
-          const headResponse = await fetch(session.videoUrl, { method: 'HEAD' });
+          const headResponse = await fetch(video.video_url, { method: 'HEAD' });
           const contentLength = headResponse.headers.get('content-length');
           videoSize = contentLength ? parseInt(contentLength) : 0;
         } catch (error) {
@@ -966,38 +954,41 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
       try {
         const decoded = jwt.verify(token, JWT_SECRET);
         
-        // Vérifier que le token contient sessionId
-        if (!decoded.sessionId) {
-          console.error('[HLS Segment] Token sans sessionId');
-          return res.status(401).json({ error: 'Token invalide - sessionId manquant' });
-        }
-        
-        const session = secureStreams.get(decoded.sessionId);
-
-        if (!session) {
-          console.error('[HLS Segment] Session non trouvée:', decoded.sessionId);
-          return res.status(401).json({ error: 'Session non trouvée' });
-        }
-        
-        if (session.type !== 'hls') {
-          console.error('[HLS Segment] Type de session incorrect:', session.type);
-          return res.status(401).json({ error: 'Type de session incorrect' });
-        }
-        
-        if (Date.now() > session.expiresAt) {
-          console.error('[HLS Segment] Session expirée');
-          return res.status(401).json({ error: 'Session expirée' });
+        // Vérifier que le token contient les informations nécessaires
+        if (!decoded.sessionId || !decoded.userId || !decoded.videoId) {
+          console.error('[HLS Segment] Token incomplet:', { hasSessionId: !!decoded.sessionId, hasUserId: !!decoded.userId, hasVideoId: !!decoded.videoId });
+          return res.status(401).json({ error: 'Token invalide - informations manquantes' });
         }
 
-        // Vérifier le Referer/Origin
+        // Vérifier le Referer/Origin (assoupli pour les requêtes HLS)
         const referer = req.headers.referer || '';
         const origin = req.headers.origin || '';
         const host = req.headers.host || '';
         const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
         const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
         
+        // Ne bloquer que si un referer/origin est présent et invalide
         if ((referer || origin) && !isValidReferer && !isValidOrigin) {
+          logSuspiciousActivity('INVALID_REFERER_HLS_SEGMENT', { 
+            userId: decoded.userId, 
+            videoId: decoded.videoId,
+            referer,
+            origin,
+            ip: getClientIp(req)
+          });
           return res.status(403).json({ error: 'Accès refusé' });
+        }
+
+        // Récupérer l'URL de la vidéo depuis la base de données (car les sessions ne persistent pas sur serverless)
+        const { data: video, error: videoError } = await supabase
+          .from('videos')
+          .select('video_url, id')
+          .eq('id', decoded.videoId)
+          .single();
+
+        if (videoError || !video || !video.video_url) {
+          console.error('[HLS Segment] Vidéo non trouvée:', decoded.videoId);
+          return res.status(404).json({ error: 'Vidéo non trouvée' });
         }
 
         // Récupérer le segment avec watermarking
@@ -1006,13 +997,14 @@ ${baseUrl}/segment.ts?token=${encodeURIComponent(segmentToken)}&index=${i}
         const end = start + segmentSize - 1;
 
         // Faire une requête proxy vers la vidéo avec Range
-        const videoResponse = await fetch(session.videoUrl, {
+        const videoResponse = await fetch(video.video_url, {
           headers: {
             'Range': `bytes=${start}-${end}`
           }
         });
 
         if (!videoResponse.ok && videoResponse.status !== 206) {
+          console.error('[HLS Segment] Erreur fetch vidéo:', videoResponse.status);
           return res.status(videoResponse.status).json({ error: 'Erreur de récupération segment' });
         }
 
