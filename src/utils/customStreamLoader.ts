@@ -120,15 +120,19 @@ export class CustomStreamLoader {
 
         this.mediaSource.addEventListener('sourceopen', () => {
           try {
+            console.log('[CustomStream] 🔓 MediaSource ouvert, ajout du SourceBuffer...');
             this.sourceBuffer = this.mediaSource!.addSourceBuffer(codec);
             this.sourceBuffer.mode = 'sequence';
             
+            // Le SourceBuffer est prêt immédiatement après création
+            if (!this.isInitialized) {
+              this.isInitialized = true;
+              console.log('[CustomStream] ✅ MediaSource initialisé');
+              resolve();
+            }
+            
             this.sourceBuffer.addEventListener('updateend', () => {
-              if (!this.isInitialized) {
-                this.isInitialized = true;
-                console.log('[CustomStream] ✅ MediaSource initialisé');
-                resolve();
-              }
+              console.log('[CustomStream] 📝 SourceBuffer mis à jour');
             });
 
             this.sourceBuffer.addEventListener('error', (e) => {
@@ -136,6 +140,7 @@ export class CustomStreamLoader {
               reject(new Error('Erreur SourceBuffer'));
             });
           } catch (error) {
+            console.error('[CustomStream] ❌ Erreur lors de l\'ajout du SourceBuffer:', error);
             reject(error);
           }
         }, { once: true });
@@ -180,9 +185,10 @@ export class CustomStreamLoader {
     const initialChunks = this.getInitialChunkIndices();
     console.log('[CustomStream] 📦 Chargement des chunks initiaux:', initialChunks);
 
-    // Charger les chunks initiaux en parallèle
-    const promises = initialChunks.map(index => this.loadChunk(index));
-    await Promise.all(promises);
+    // Charger le premier chunk d'abord (séquentiel pour MediaSource)
+    for (const index of initialChunks) {
+      await this.loadChunk(index);
+    }
   }
 
   /**
@@ -211,16 +217,21 @@ export class CustomStreamLoader {
     this.loadedChunks.add(index);
 
     try {
+      console.log(`[CustomStream] 📥 Chargement du chunk ${index}...`);
       const chunk = await this.fetchChunk(index);
+      console.log(`[CustomStream] ✅ Chunk ${index} chargé (${chunk.data.byteLength} bytes)`);
       this.chunks.set(index, chunk);
       
       // Ajouter le chunk au SourceBuffer si c'est le prochain attendu
       if (index === this.currentChunkIndex) {
+        console.log(`[CustomStream] ➕ Ajout du chunk ${index} au SourceBuffer...`);
         await this.appendChunkToBuffer(chunk);
         this.currentChunkIndex++;
         
         // Charger le chunk suivant
         this.loadNextChunk();
+      } else {
+        console.log(`[CustomStream] ⏳ Chunk ${index} chargé mais pas encore ajouté (attendu: ${this.currentChunkIndex})`);
       }
     } catch (error) {
       console.error(`[CustomStream] ❌ Erreur chunk ${index}:`, error);
@@ -275,11 +286,13 @@ export class CustomStreamLoader {
    */
   private async appendChunkToBuffer(chunk: VideoChunk): Promise<void> {
     if (!this.sourceBuffer || this.isAborted) {
+      console.warn('[CustomStream] ⚠️ SourceBuffer non disponible ou aborted');
       return;
     }
 
     return new Promise((resolve, reject) => {
       if (this.sourceBuffer!.updating) {
+        console.log('[CustomStream] ⏳ SourceBuffer en cours de mise à jour, attente...');
         this.sourceBuffer!.addEventListener('updateend', () => {
           this.appendChunkToBuffer(chunk).then(resolve).catch(reject);
         }, { once: true });
@@ -287,9 +300,11 @@ export class CustomStreamLoader {
       }
 
       try {
+        console.log(`[CustomStream] 📤 Ajout de ${chunk.data.byteLength} bytes au SourceBuffer...`);
         this.sourceBuffer!.appendBuffer(chunk.data);
         
         this.sourceBuffer!.addEventListener('updateend', () => {
+          console.log(`[CustomStream] ✅ Chunk ${chunk.index} ajouté au buffer`);
           // Mettre à jour la progression
           if (this.options.onProgress && this.videoMetadata) {
             const loaded = (this.currentChunkIndex / this.videoMetadata.totalChunks) * 100;
@@ -297,7 +312,13 @@ export class CustomStreamLoader {
           }
           resolve();
         }, { once: true });
+        
+        this.sourceBuffer!.addEventListener('error', (e) => {
+          console.error('[CustomStream] ❌ Erreur lors de l\'ajout au buffer:', e);
+          reject(new Error('Erreur appendBuffer'));
+        }, { once: true });
       } catch (error) {
+        console.error('[CustomStream] ❌ Exception lors de appendBuffer:', error);
         reject(error);
       }
     });
