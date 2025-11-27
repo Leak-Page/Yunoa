@@ -92,12 +92,18 @@ export class StreamingMSELoader {
     const blobParts: BlobPart[] = [];
     let blobUrl: string | null = null;
     let isVideoReady = false;
-    const INITIAL_CHUNKS = 3; // Charger 3 segments pour démarrer rapidement
-    const UPDATE_INTERVAL = 2; // Mettre à jour le blob tous les 2 segments
+    const INITIAL_CHUNKS = 5; // Charger 5 segments pour démarrer avec un bon buffer
+    const UPDATE_INTERVAL = 5; // Mettre à jour le blob tous les 5 segments (moins fréquent)
+    let lastUpdateChunkCount = 0;
 
     // Fonction pour créer/mettre à jour le blob
     const updateBlob = (force: boolean = false) => {
       if (blobParts.length === 0) return;
+
+      // Ne pas créer de nouveau blob si on n'a pas assez de nouveaux segments
+      if (!force && blobParts.length - lastUpdateChunkCount < UPDATE_INTERVAL && isVideoReady) {
+        return;
+      }
 
       const newBlob = new Blob(blobParts, { type: 'video/mp4' });
       const newBlobUrl = URL.createObjectURL(newBlob);
@@ -111,9 +117,10 @@ export class StreamingMSELoader {
         this.options.videoElement.src = blobUrl;
         this.options.videoElement.load();
         isVideoReady = true;
+        lastUpdateChunkCount = blobParts.length;
         console.log(`[StreamingMSE] 🎬 Vidéo prête avec ${blobParts.length} segments`);
-      } else if (isVideoReady && (force || blobParts.length % UPDATE_INTERVAL === 0)) {
-        // Mettre à jour le blob progressivement
+      } else if (isVideoReady && (force || blobParts.length - lastUpdateChunkCount >= UPDATE_INTERVAL)) {
+        // Mettre à jour le blob progressivement seulement si nécessaire
         const videoElement = this.options.videoElement;
         const wasPlaying = !videoElement.paused;
         const currentTime = videoElement.currentTime || 0;
@@ -125,21 +132,34 @@ export class StreamingMSELoader {
         const duration = videoElement.duration || 0;
         const bufferAhead = bufferedEnd - currentTime;
         
-        // Mettre à jour seulement si le buffer est faible
-        if (force || bufferAhead < 10 || (duration > 0 && duration - currentTime < 30)) {
+        // Mettre à jour seulement si le buffer est vraiment faible ou si on force
+        if (force || bufferAhead < 5 || (duration > 0 && duration - currentTime < 20)) {
+          // Sauvegarder l'état avant de changer la source
+          const savedTime = currentTime;
+          const savedPlaying = wasPlaying;
+          
+          // Changer la source
           if (blobUrl) {
             URL.revokeObjectURL(blobUrl);
           }
           blobUrl = newBlobUrl;
-          videoElement.src = blobUrl;
           
-          // Restaurer la position et l'état de lecture
-          if (currentTime > 0) {
-            videoElement.currentTime = currentTime;
-          }
-          if (wasPlaying) {
-            videoElement.play().catch(() => {});
-          }
+          // Attendre que la nouvelle source soit prête avant de restaurer
+          const handleLoadedMetadata = () => {
+            videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
+            if (savedTime > 0) {
+              videoElement.currentTime = savedTime;
+            }
+            if (savedPlaying) {
+              videoElement.play().catch(() => {});
+            }
+            lastUpdateChunkCount = blobParts.length;
+            console.log(`[StreamingMSE] 📊 Blob mis à jour avec ${blobParts.length} segments`);
+          };
+          
+          videoElement.addEventListener('loadedmetadata', handleLoadedMetadata, { once: true });
+          videoElement.src = blobUrl;
+          videoElement.load();
         } else {
           // Pas besoin de mettre à jour maintenant, libérer le blob
           URL.revokeObjectURL(newBlobUrl);
@@ -172,8 +192,26 @@ export class StreamingMSELoader {
           this.options.onProgress(Math.min(loaded, this.totalSize), this.totalSize);
         }
 
-        // Mettre à jour le blob progressivement
-        updateBlob(false);
+        // Mettre à jour le blob progressivement (seulement si nécessaire)
+        // Ne pas mettre à jour à chaque segment pour éviter les interruptions
+        if (!isVideoReady || blobParts.length % UPDATE_INTERVAL === 0) {
+          updateBlob(false);
+        }
+
+        // Si la vidéo est prête, vérifier le buffer et charger plus si nécessaire
+        if (isVideoReady) {
+          const videoElement = this.options.videoElement;
+          const bufferedEnd = videoElement.buffered.length > 0 
+            ? videoElement.buffered.end(videoElement.buffered.length - 1) 
+            : 0;
+          const currentTime = videoElement.currentTime || 0;
+          const bufferAhead = bufferedEnd - currentTime;
+          
+          // Si le buffer est très faible, forcer une mise à jour
+          if (bufferAhead < 3) {
+            updateBlob(true);
+          }
+        }
 
       } catch (error) {
         console.error(`[StreamingMSE] ❌ Erreur segment ${i}:`, error);
@@ -226,8 +264,7 @@ export class StreamingMSELoader {
       videoId: this.options.videoId,
       chunkIndex,
       timestamp: Date.now(),
-      fingerprint: this.fingerprint!,
-      encrypted: false
+      fingerprint: this.fingerprint!
     };
 
     if (this.sessionId) {
