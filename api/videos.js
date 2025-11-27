@@ -225,14 +225,19 @@ export default async (req, res) => {
       }
 
       // Récupérer les infos de la vidéo
-      const { data: video, error } = await supabase
+      const { data: video, error: videoError } = await supabase
         .from('videos')
         .select('video_url, title')
         .eq('id', videoId)
         .single();
 
-      if (error || !video) {
-        return res.status(404).json({ error: 'Vidéo non trouvée' });
+      if (videoError) {
+        console.error('❌ Erreur Supabase:', videoError);
+        return res.status(404).json({ error: 'Vidéo non trouvée', details: videoError.message });
+      }
+
+      if (!video || !video.video_url) {
+        return res.status(404).json({ error: 'Vidéo non trouvée ou URL manquante' });
       }
 
       // Créer une session de streaming sécurisé
@@ -271,8 +276,8 @@ export default async (req, res) => {
         size = 100 * 1024 * 1024; // 100 MB par défaut
       }
 
-      // Calculer le nombre total de chunks avec la taille de chunk de la session
-      const totalChunks = Math.ceil(size / (session.chunkSize || 1024 * 1024));
+      // Calculer le nombre total de chunks avec la taille de chunk par défaut
+      const totalChunks = Math.ceil(size / defaultChunkSize);
 
       return res.json({
         sessionId,
