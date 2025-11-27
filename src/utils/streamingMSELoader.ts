@@ -156,12 +156,25 @@ export class StreamingMSELoader {
       // Gérer les événements du SourceBuffer
       this.sourceBuffer.addEventListener('updateend', () => {
         this.isAppending = false;
+        console.log(`[StreamingMSE] 📊 updateend - Prochain segment à ajouter: ${this.nextChunkToAppend}`);
+        // Traiter la file d'attente pour ajouter le prochain segment
         this.processSegmentQueue();
+      });
+
+      this.sourceBuffer.addEventListener('update', () => {
+        // Événement déclenché pendant l'ajout
+        console.log('[StreamingMSE] 📊 update - Segment en cours d\'ajout');
       });
 
       this.sourceBuffer.addEventListener('error', (e) => {
         console.error('[StreamingMSE] ❌ Erreur SourceBuffer:', e);
+        this.isAppending = false;
         this.options.onError?.(new Error('Erreur SourceBuffer'));
+      });
+
+      this.sourceBuffer.addEventListener('abort', () => {
+        console.warn('[StreamingMSE] ⚠️ SourceBuffer abort');
+        this.isAppending = false;
       });
 
     } catch (error) {
@@ -186,6 +199,11 @@ export class StreamingMSELoader {
     
     await Promise.all(initialPromises);
     
+    console.log(`[StreamingMSE] ✅ ${initialSegments} segments initiaux chargés, traitement de la file d'attente...`);
+    
+    // Traiter la file d'attente pour ajouter les segments au SourceBuffer
+    this.processSegmentQueue();
+    
     // Continuer le chargement en arrière-plan
     this.continueLoading();
   }
@@ -194,17 +212,34 @@ export class StreamingMSELoader {
    * Continue le chargement des segments restants
    */
   private async continueLoading(): Promise<void> {
-    while (this.nextChunkToAppend < this.totalChunks && !this.isAborted && !this.options.signal?.aborted) {
+    let lastLoadedChunk = -1;
+    
+    while (this.loadedChunks < this.totalChunks && !this.isAborted && !this.options.signal?.aborted) {
+      // Trouver le prochain segment à charger (le plus petit index non chargé)
+      let nextChunkToLoad = -1;
+      for (let i = 0; i < this.totalChunks; i++) {
+        if (!this.loadedSegments.has(i) && !this.loadingChunks.has(i)) {
+          nextChunkToLoad = i;
+          break;
+        }
+      }
+
+      // Si aucun segment à charger, attendre un peu
+      if (nextChunkToLoad === -1) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+
       // Calculer combien de segments charger en parallèle
       const segmentsToLoad = Math.min(
         this.maxConcurrentRequests - this.loadingChunks.size,
-        this.totalChunks - this.nextChunkToAppend
+        this.totalChunks - nextChunkToLoad
       );
 
       // Charger les segments en parallèle
       const loadPromises: Promise<void>[] = [];
       for (let i = 0; i < segmentsToLoad; i++) {
-        const chunkIndex = this.nextChunkToAppend + i;
+        const chunkIndex = nextChunkToLoad + i;
         if (chunkIndex < this.totalChunks && !this.loadedSegments.has(chunkIndex) && !this.loadingChunks.has(chunkIndex)) {
           loadPromises.push(this.loadSegment(chunkIndex));
         }
@@ -214,22 +249,35 @@ export class StreamingMSELoader {
         await Promise.all(loadPromises);
       }
 
+      // Traiter la file d'attente après chaque chargement
+      this.processSegmentQueue();
+
       // Vérifier si on doit charger plus de segments
       const bufferAhead = this.getBufferAhead();
-      if (bufferAhead > 30) {
-        // Buffer suffisant, attendre un peu
-        await new Promise(resolve => setTimeout(resolve, 500));
+      if (bufferAhead > 30 && this.loadedChunks > lastLoadedChunk + 5) {
+        // Buffer suffisant et on a chargé plusieurs segments, attendre un peu
+        await new Promise(resolve => setTimeout(resolve, 200));
       } else {
-        // Buffer faible, continuer le chargement
+        // Buffer faible ou on vient de charger, continuer rapidement
         await new Promise(resolve => setTimeout(resolve, 50));
       }
+
+      lastLoadedChunk = this.loadedChunks;
     }
 
     // Tous les segments sont chargés, fermer MediaSource
     if (this.loadedChunks === this.totalChunks && this.mediaSource && this.mediaSource.readyState === 'open') {
+      // Attendre que tous les segments soient ajoutés au SourceBuffer
+      while (this.nextChunkToAppend < this.totalChunks) {
+        this.processSegmentQueue();
+        if (this.nextChunkToAppend < this.totalChunks) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+      
       try {
         this.mediaSource.endOfStream();
-        console.log('[StreamingMSE] ✅ Tous les segments chargés');
+        console.log('[StreamingMSE] ✅ Tous les segments chargés et ajoutés');
       } catch (e) {
         console.warn('[StreamingMSE] ⚠️ Impossible de fermer MediaSource:', e);
       }
@@ -285,14 +333,29 @@ export class StreamingMSELoader {
    * Traite la file d'attente des segments pour les ajouter au SourceBuffer
    */
   private processSegmentQueue(): void {
-    if (!this.sourceBuffer || this.isAppending || this.mediaSource?.readyState !== 'open') {
+    if (!this.sourceBuffer || this.mediaSource?.readyState !== 'open') {
+      if (!this.sourceBuffer) {
+        console.warn('[StreamingMSE] ⚠️ SourceBuffer non disponible');
+      }
+      if (this.mediaSource?.readyState !== 'open') {
+        console.warn(`[StreamingMSE] ⚠️ MediaSource state: ${this.mediaSource?.readyState}`);
+      }
+      return;
+    }
+
+    // Si on est en train d'ajouter, attendre
+    if (this.isAppending || this.sourceBuffer.updating) {
       return;
     }
 
     // Chercher le prochain segment à ajouter (dans l'ordre)
     while (this.loadedSegments.has(this.nextChunkToAppend)) {
       const segment = this.loadedSegments.get(this.nextChunkToAppend);
-      if (!segment) break;
+      if (!segment) {
+        this.loadedSegments.delete(this.nextChunkToAppend);
+        this.nextChunkToAppend++;
+        continue;
+      }
 
       try {
         // Vérifier si le SourceBuffer a de l'espace
@@ -304,12 +367,19 @@ export class StreamingMSELoader {
         this.sourceBuffer.appendBuffer(segment);
         this.isAppending = true;
         this.loadedSegments.delete(this.nextChunkToAppend);
+        const addedChunk = this.nextChunkToAppend;
         this.nextChunkToAppend++;
 
-        console.log(`[StreamingMSE] ✅ Segment ${this.nextChunkToAppend - 1}/${this.totalChunks} ajouté`);
+        console.log(`[StreamingMSE] ✅ Segment ${addedChunk}/${this.totalChunks} ajouté au SourceBuffer`);
+
+        // Sortir de la boucle car on attend l'événement updateend
+        return;
 
       } catch (error) {
         console.error(`[StreamingMSE] ❌ Erreur ajout segment ${this.nextChunkToAppend}:`, error);
+        // Retirer le segment problématique et continuer
+        this.loadedSegments.delete(this.nextChunkToAppend);
+        this.nextChunkToAppend++;
         // Réessayer plus tard
         break;
       }
