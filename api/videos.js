@@ -191,7 +191,7 @@ export default async (req, res) => {
           return res.status(403).json({ error: 'Accès refusé' });
         }
 
-        // SÉCURITÉ : Vérifier strictement le Referer/Origin - BLOQUER si pas du site
+        // SÉCURITÉ : Vérifier le Referer/Origin - Logger mais ne pas bloquer si manquant (peut être normal pour les requêtes vidéo)
         const referer = req.headers.referer || '';
         const origin = req.headers.origin || '';
         const host = req.headers.host || '';
@@ -200,7 +200,9 @@ export default async (req, res) => {
         const isValidReferer = referer && (referer.includes(host) || referer.includes('yunoa.xyz'));
         const isValidOrigin = origin && (origin.includes(host) || origin.includes('yunoa.xyz'));
         
-        if (!isValidReferer && !isValidOrigin) {
+        // Si on a un Referer ou Origin, il doit être valide
+        // Mais on ne bloque pas si les deux sont absents (peut être normal pour certaines requêtes vidéo)
+        if ((referer || origin) && !isValidReferer && !isValidOrigin) {
           logSuspiciousActivity('INVALID_REFERER_ORIGIN', { 
             userId, 
             videoId, 
@@ -235,22 +237,32 @@ export default async (req, res) => {
             tracker.ranges.push({ start, time: now });
             
             // Détecter si on télécharge séquentiellement (pattern de téléchargement)
-            if (tracker.ranges.length > 5) {
-              const recentRanges = tracker.ranges.slice(-10);
+            // Seulement si on a beaucoup de requêtes (plus de 20) pour éviter les faux positifs
+            if (tracker.ranges.length > 20) {
+              const recentRanges = tracker.ranges.slice(-30);
               let sequentialCount = 0;
+              let largeRangesCount = 0;
+              
               for (let i = 1; i < recentRanges.length; i++) {
                 if (recentRanges[i].start > recentRanges[i-1].start) {
                   sequentialCount++;
                 }
+                // Compter les ranges qui sont proches (pattern de téléchargement)
+                const gap = recentRanges[i].start - recentRanges[i-1].start;
+                if (gap > 0 && gap < 10 * 1024 * 1024) { // Moins de 10MB entre les requêtes
+                  largeRangesCount++;
+                }
               }
               
-              // Si plus de 80% des requêtes sont séquentielles, c'est probablement un téléchargement
-              if (sequentialCount / recentRanges.length > 0.8) {
+              // Si plus de 90% des requêtes sont séquentielles ET on a beaucoup de requêtes, c'est probablement un téléchargement
+              const sequentialRatio = sequentialCount / recentRanges.length;
+              if (sequentialRatio > 0.9 && tracker.count > 30) {
                 logSuspiciousActivity('DOWNLOAD_PATTERN_DETECTED', { 
                   userId, 
                   videoId, 
                   sequentialCount,
                   totalRanges: recentRanges.length,
+                  sequentialRatio: sequentialRatio.toFixed(2),
                   ip: clientIp
                 });
                 return res.status(403).json({ error: 'Accès refusé - Pattern de téléchargement détecté' });
@@ -309,11 +321,11 @@ export default async (req, res) => {
               range = `bytes=${start}-${start + maxChunkSize - 1}`;
             }
             
-            // SÉCURITÉ : Empêcher les requêtes qui couvrent plus de 10% de la vidéo
+            // SÉCURITÉ : Empêcher les requêtes qui couvrent plus de 20% de la vidéo (plus permissif pour le streaming)
             if (videoSize > 0) {
               const requestedSize = (end !== null ? end : start + maxChunkSize) - start;
               const percentage = (requestedSize / videoSize) * 100;
-              if (percentage > 10) {
+              if (percentage > 20) {
                 logSuspiciousActivity('LARGE_RANGE_REQUEST', { 
                   userId, 
                   videoId, 
