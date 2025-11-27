@@ -61,7 +61,7 @@ const SecurityGuard: React.FC<{
   const authChallengeRef = useRef<{ step: number; data: any }>({ step: 0, data: {} });
 
   // Types de violations qui ne déclenchent PAS le blocage
-  const NON_BLOCKING_VIOLATIONS = ['context_menu_blocked', 'keyboard_shortcut_blocked', 'screenshot_attempt_blocked'];
+  const NON_BLOCKING_VIOLATIONS = ['context_menu_blocked', 'keyboard_shortcut_blocked', 'screenshot_attempt_blocked', 'page_visibility_suspicious'];
 
   const addViolation = useCallback((type: string, details?: string) => {
     const violation: SecurityViolation = {
@@ -447,25 +447,26 @@ const SecurityGuard: React.FC<{
         setupProtectionStyles();
         setupTokenProtection();
         
-        // Détection de focus/blur pour les tentatives de capture
-        let isPageVisible = true;
-        
-        const handleVisibilityChange = () => {
-          if (document.hidden && isPageVisible) {
-            // Page devient cachée - possible capture d'écran
-            isPageVisible = false;
-            document.body.classList.add('screenshot-protection');
-            addViolation('page_visibility_suspicious', 'Changement de visibilité suspect');
-            
-            setTimeout(() => {
-              document.body.classList.remove('screenshot-protection');
-            }, 2000);
-          } else if (!document.hidden) {
-            isPageVisible = true;
-          }
-        };
-        
-        document.addEventListener('visibilitychange', handleVisibilityChange);
+        // Détection de focus/blur pour les tentatives de capture - DÉSACTIVÉE
+        // La détection de visibilité de page est trop sensible et bloque l'accès normal
+        // let isPageVisible = true;
+        // 
+        // const handleVisibilityChange = () => {
+        //   if (document.hidden && isPageVisible) {
+        //     // Page devient cachée - possible capture d'écran
+        //     isPageVisible = false;
+        //     document.body.classList.add('screenshot-protection');
+        //     addViolation('page_visibility_suspicious', 'Changement de visibilité suspect');
+        //     
+        //     setTimeout(() => {
+        //       document.body.classList.remove('screenshot-protection');
+        //     }, 2000);
+        //   } else if (!document.hidden) {
+        //     isPageVisible = true;
+        //   }
+        // };
+        // 
+        // document.addEventListener('visibilitychange', handleVisibilityChange);
         
         // Détection de perte de focus suspecte - DÉSACTIVÉE (trop sensible pour les sites de streaming)
         // const handleBlur = () => {
